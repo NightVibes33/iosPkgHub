@@ -14,7 +14,7 @@ targets:
       - path: payload.json
         buildPhase: resources
     settings:
-      PRODUCT_BUNDLE_IDENTIFIER: com.mrw.PKGSender
+      PRODUCT_BUNDLE_IDENTIFIER: com.pkgsender.app
       INFOPLIST_FILE: PKGSender/Info.plist
       SWIFT_VERSION: 5.0
       TARGETED_DEVICE_FAMILY: "1,2"
