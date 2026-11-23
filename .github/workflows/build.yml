@@ -1,51 +1,49 @@
-name: Build PKG Sender IPA
+name: Build PKG Sender iOS 27 unsigned IPA
 
 on:
   workflow_dispatch:
   push:
     branches:
       - main
+      - fix/usb-network-port-and-ios27-build
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: xcode-27
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install XcodeGen
-        run: brew install xcodegen
-
-      - name: Find and Create App Icon Assets
+      - name: Verify macOS 27 and iOS 27 SDK
         run: |
-          echo "Searching for PKG Sender app icon..."
+          sw_vers
+          xcodebuild -version
+          xcodebuild -showsdks | tee sdk-list.txt
+          grep -q "iOS 27" sdk-list.txt
 
-          ICON_FILE=$(find . -type f -iname "PKGSender_AppIcon_1024.png" | head -n 1)
-
-          if [ -z "$ICON_FILE" ]; then
-            echo "ERROR: PKGSender_AppIcon_1024.png was not found."
-            echo "Files available in repository:"
-            find . -type f
-            exit 1
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
           fi
+          xcodegen --version
 
-          echo "Found icon at: $ICON_FILE"
-
+      - name: Create App Icon Assets
+        run: |
+          ICON_FILE=$(find . -type f -iname "PKGSender_AppIcon_1024.png" | head -n 1)
+          test -n "$ICON_FILE"
           mkdir -p PKGSender/Assets.xcassets/AppIcon.appiconset
-
-          cp "$ICON_FILE" \
-            PKGSender/Assets.xcassets/AppIcon.appiconset/AppIcon.png
-
+          cp "$ICON_FILE" PKGSender/Assets.xcassets/AppIcon.appiconset/AppIcon.png
           cat > PKGSender/Assets.xcassets/Contents.json <<'EOF'
           {
-            "info": {
-              "author": "xcode",
-              "version": 1
-            }
+            "info": { "author": "xcode", "version": 1 }
           }
           EOF
-
           cat > PKGSender/Assets.xcassets/AppIcon.appiconset/Contents.json <<'EOF'
           {
             "images": [
@@ -56,44 +54,89 @@ jobs:
                 "size": "1024x1024"
               }
             ],
-            "info": {
-              "author": "xcode",
-              "version": 1
-            }
+            "info": { "author": "xcode", "version": 1 }
           }
           EOF
-
-          echo "App icon assets created successfully."
 
       - name: Generate Xcode Project
         run: xcodegen generate
 
-      - name: Build App
+      - name: Run unit tests on iOS 27 Simulator
         run: |
-          xcodebuild \
+          xcodebuild test \
+            -project PKGSender.xcodeproj \
+            -scheme PKGSender \
+            -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest' \
+            -derivedDataPath build/TestDerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Build unsigned iOS device app
+        run: |
+          xcodebuild build \
             -project PKGSender.xcodeproj \
             -scheme PKGSender \
             -configuration Release \
+            -destination 'generic/platform=iOS' \
             -sdk iphoneos \
-            -derivedDataPath build \
+            -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             ASSETCATALOG_COMPILER_APPICON_NAME=AppIcon
 
-      - name: Create IPA
+      - name: Package and validate unsigned IPA
         run: |
-          rm -rf Payload
-          mkdir -p Payload
+          APP_PATH="build/DerivedData/Build/Products/Release-iphoneos/PKGSender.app"
+          test -d "$APP_PATH"
+          test -f "$APP_PATH/pkgusb.elf"
+          test -f "$APP_PATH/payload.json"
+          plutil -lint "$APP_PATH/Info.plist"
 
-          cp -R \
-            build/Build/Products/Release-iphoneos/PKGSender.app \
-            Payload/
+          EXPECTED_SHA=$(python3 -c 'import json; print(json.load(open("payload.json"))["sha256"])')
+          ACTUAL_SHA=$(shasum -a 256 "$APP_PATH/pkgusb.elf" | awk '{print $1}')
+          echo "Bundled payload SHA256: $ACTUAL_SHA"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA"
 
-          zip -r PKGSender-unsigned.ipa Payload
+          python3 - "$APP_PATH/pkgusb.elf" <<'PY'
+          import struct, sys
+          data = open(sys.argv[1], "rb").read(64)
+          assert data[:4] == b"\x7fELF", "payload is not ELF"
+          assert data[4] == 2 and data[5] == 1, "payload must be ELF64 little-endian"
+          assert struct.unpack_from("<H", data, 18)[0] == 62, "payload must target x86-64"
+          print("Bundled PS4 payload ELF header: OK")
+          PY
 
-      - name: Upload IPA
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")
+          test "$BUNDLE_ID" = "com.mrw.PKGSender"
+          file "$APP_PATH/PKGSender"
+
+          rm -rf package
+          mkdir -p package/Payload
+          cp -R "$APP_PATH" package/Payload/
+          (cd package && /usr/bin/zip -qry "$GITHUB_WORKSPACE/PKGSender-iOS27-unsigned.ipa" Payload)
+          unzip -t PKGSender-iOS27-unsigned.ipa
+
+          {
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Runner OS: $ImageOS $ImageVersion"
+            sw_vers
+            xcodebuild -version
+            echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+            echo "Bundle ID: $BUNDLE_ID"
+            echo "Payload SHA256: $ACTUAL_SHA"
+            echo "IPA SHA256: $(shasum -a 256 PKGSender-iOS27-unsigned.ipa | awk '{print $1}')"
+            echo "Signing: disabled (unsigned IPA)"
+          } > build-info.txt
+
+      - name: Upload unsigned IPA and build metadata
         uses: actions/upload-artifact@v4
         with:
-          name: PKGSender-IPA
-          path: PKGSender-unsigned.ipa
+          name: PKGSender-iOS27-unsigned-${{ github.sha }}
+          path: |
+            PKGSender-iOS27-unsigned.ipa
+            build-info.txt
+          if-no-files-found: error
+          retention-days: 30

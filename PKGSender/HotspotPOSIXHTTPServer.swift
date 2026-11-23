@@ -17,7 +17,7 @@ final class HotspotPOSIXHTTPServer: PKGHTTPServing {
     private var listenFD: Int32 = -1
     private var stopped = false
     private var fileSize: UInt64 = 0
-    private var highestPosition: UInt64 = 0
+    private var byteCoverage = ByteRangeCoverage()
     private var totalWireBytes: UInt64 = 0
     private var speedStartedAt = Date()
     private let port: UInt16 = 8080
@@ -211,11 +211,16 @@ final class HotspotPOSIXHTTPServer: PKGHTTPServing {
     private func record(position: UInt64, bytes: UInt64) {
         queue.async { [weak self] in
             guard let self = self else { return }
-            self.highestPosition = max(self.highestPosition, min(position, self.fileSize))
+            let rangeStart = position >= bytes ? position - bytes : 0
+            self.byteCoverage.add(start: rangeStart, length: bytes, limit: self.fileSize)
             self.totalWireBytes += bytes
             let elapsed = max(Date().timeIntervalSince(self.speedStartedAt), 0.001)
             let speed = Double(self.totalWireBytes) / elapsed
-            let p = LocalHTTPServer.TransferProgress(sentBytes: self.highestPosition, totalBytes: self.fileSize, bytesPerSecond: speed)
+            let p = LocalHTTPServer.TransferProgress(
+                sentBytes: min(self.byteCoverage.coveredBytes, self.fileSize),
+                totalBytes: self.fileSize,
+                bytesPerSecond: speed
+            )
             DispatchQueue.main.async { self.onProgress(p) }
         }
     }
