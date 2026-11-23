@@ -6,6 +6,9 @@ on:
     branches:
       - main
       - fix/usb-network-port-and-ios27-build
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
