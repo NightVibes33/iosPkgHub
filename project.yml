@@ -21,3 +21,23 @@ targets:
       CODE_SIGN_STYLE: Manual
       CODE_SIGNING_ALLOWED: NO
       CODE_SIGNING_REQUIRED: NO
+
+  PKGSenderTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: PKGSenderTests
+    dependencies:
+      - target: PKGSender
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.mrw.PKGSenderTests
+      GENERATE_INFOPLIST_FILE: YES
+
+schemes:
+  PKGSender:
+    build:
+      targets:
+        PKGSender: all
+    test:
+      targets:
+        - PKGSenderTests

@@ -68,7 +68,7 @@ final class LocalHTTPServer {
      Speed is NOT calculated from position jumps because PlayStation
      can open parallel Range requests at different offsets.
      */
-    private var highestPosition: UInt64 = 0
+    private var byteCoverage = ByteRangeCoverage()
     private var knownTotalSize: UInt64 = 0
 
     /*
@@ -766,8 +766,7 @@ final class LocalHTTPServer {
                         self.speedSamples =
                             [(time: Date(), bytes: 0)]
 
-                        self.highestPosition =
-                            start
+                        self.byteCoverage.reset()
 
                         self.smoothedSpeed =
                             0
@@ -1087,28 +1086,15 @@ final class LocalHTTPServer {
         let now =
             Date()
 
-        let currentPosition =
-            min(
-                position,
-                total
+        if bytesJustSent > 0, position >= bytesJustSent {
+            byteCoverage.add(
+                start: position - bytesJustSent,
+                length: bytesJustSent,
+                limit: total
             )
-
-        /*
-         Progress never moves backwards even if PlayStation starts
-         another Range slightly behind the current Range.
-         */
-        if currentPosition >
-            highestPosition {
-
-            highestPosition =
-                currentPosition
         }
 
-        let visiblePosition =
-            min(
-                highestPosition,
-                total
-            )
+        let visiblePosition = min(byteCoverage.coveredBytes, total)
 
         /*
          Count real bytes processed by NWConnection.
@@ -1202,8 +1188,7 @@ final class LocalHTTPServer {
         transferStarted =
             false
 
-        highestPosition =
-            0
+        byteCoverage.reset()
 
         knownTotalSize =
             0

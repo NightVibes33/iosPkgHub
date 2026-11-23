@@ -176,6 +176,11 @@ struct ContentView: View {
     @AppStorage("playStationPort")
     private var psPort = "12800"
 
+    @AppStorage("playStationBinLoaderPort")
+    private var binLoaderPort = "9090"
+
+    @State private var usbWatchdogToken = UUID()
+
     @AppStorage("hasCompletedFirstLaunch")
     private var hasCompletedFirstLaunch = false
 
@@ -298,7 +303,7 @@ struct ContentView: View {
                 case .tools:
                     ToolsView(appLanguage: appLanguage, psIP: psIP)
                 case .settings:
-                    SettingsView(appLanguage: $appLanguage, psPort: $psPort)
+                    SettingsView(appLanguage: $appLanguage, psPort: $psPort, binLoaderPort: $binLoaderPort)
                 }
             }
         }
@@ -2584,51 +2589,101 @@ struct ContentView: View {
             return
         }
 
-        // Keep the bridge pointed at exactly the file shown in Home, then arm it.
-        // Progress comes from unique READ ranges requested by the PS4 payload, so
-        // BGFT retries/probes do not inflate the percentage.
-        USBBridgeServer.shared.setTransferObserver { snapshot in
-            DispatchQueue.main.async {
-                guard self.isSending else { return }
-                self.applyUSBTransferSnapshot(snapshot)
-            }
+        let portText = binLoaderPort.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parsedPort = UInt16(portText), parsedPort > 0 else {
+            status = t(
+                "Invalid GoldHEN BinLoader port. Enter a value from 1 to 65535.",
+                "منفذ GoldHEN BinLoader غير صالح. أدخل قيمة من 1 إلى 65535."
+            )
+            return
         }
-        USBBridgeServer.shared.setSelectedFile(file)
-        USBBridgeServer.shared.armSelectedFile()
 
         prepareNewTransfer()
         transferStartDate = Date()
-        speedSamplesTotal = 0
-        speedSamplesCount = 0
-        peakSpeed = 0
         historySavedForTransfer = false
         isSending = true
         UIApplication.shared.isIdleTimerDisabled = true
-        status = t(
-            "USB ready. Sending selected payload to GoldHEN…",
-            "USB جاهز. جارٍ إرسال البايلود المختار إلى GoldHEN…"
-        )
+        status = t("Preparing USB bridge…", "جارٍ تجهيز جسر USB…")
 
-        PayloadManager.shared.sendBuiltInPayload(host: psIP) { result in
-            switch result {
-            case .success:
-                status = t(
-                    "Payload sent. Waiting for the PS4 USB bridge…",
-                    "تم إرسال البايلود. بانتظار اتصال USB من البلايستيشن…"
-                )
-            case .failure(let error):
-                USBBridgeServer.shared.disarm()
-                isSending = false
-                UIApplication.shared.isIdleTimerDisabled = false
-                status = t(
-                    "Could not start USB payload: \(error.localizedDescription) Make sure GoldHEN BinLoader is enabled on port 9090.",
-                    "تعذر تشغيل بايلود USB: \(error.localizedDescription) تأكد أن GoldHEN BinLoader مفعّل على المنفذ 9090."
-                )
+        USBBridgeServer.shared.prepareTransfer(
+            fileURL: file,
+            observer: { snapshot in
+                DispatchQueue.main.async {
+                    guard self.isSending else { return }
+                    self.applyUSBTransferSnapshot(snapshot)
+                }
+            },
+            completion: { result in
+                guard self.isSending else {
+                    USBBridgeServer.shared.endTransferCycle()
+                    return
+                }
+                switch result {
+                case .success:
+                    self.status = self.t(
+                        "USB bridge ready. Injecting payload through GoldHEN BinLoader…",
+                        "جسر USB جاهز. جارٍ إرسال البايلود عبر GoldHEN BinLoader…"
+                    )
+                    PayloadManager.shared.sendBuiltInPayload(host: self.psIP, port: parsedPort) { payloadResult in
+                        guard self.isSending else { return }
+                        switch payloadResult {
+                        case .success:
+                            self.status = self.t(
+                                "Payload sent. Waiting for the PS4 bridge to request the PKG…",
+                                "تم إرسال البايلود. بانتظار طلب PS4 لملف PKG عبر الجسر…"
+                            )
+                            self.scheduleUSBWatchdog()
+                        case .failure(let error):
+                            self.failUSBTransfer(
+                                self.t(
+                                    "Could not start the USB payload: \(error.localizedDescription)",
+                                    "تعذر تشغيل بايلود USB: \(error.localizedDescription)"
+                                )
+                            )
+                        }
+                    }
+                case .failure(let error):
+                    self.failUSBTransfer(
+                        self.t(
+                            "Could not prepare the USB bridge: \(error.localizedDescription)",
+                            "تعذر تجهيز جسر USB: \(error.localizedDescription)"
+                        )
+                    )
+                }
             }
+        )
+    }
+
+    private func scheduleUSBWatchdog() {
+        let token = UUID()
+        usbWatchdogToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 180) {
+            guard self.usbWatchdogToken == token,
+                  self.isSending,
+                  self.transferMode == .usb else { return }
+            self.failUSBTransfer(
+                self.t(
+                    "USB transfer stalled: no package data arrived for 3 minutes. Check the cable, payload log, and BinLoader connection.",
+                    "توقف نقل USB: لم تصل بيانات الحزمة لمدة 3 دقائق. تحقق من الكابل وسجل البايلود واتصال BinLoader."
+                )
+            )
         }
     }
 
+    private func failUSBTransfer(_ message: String) {
+        usbWatchdogToken = UUID()
+        USBBridgeServer.shared.endTransferCycle()
+        saveHistory(completed: false)
+        queueRunning = false
+        activeQueueIndex = nil
+        isSending = false
+        completed = false
+        UIApplication.shared.isIdleTimerDisabled = false
+        status = message
+    }
+
     private func applyUSBTransferSnapshot(_ transfer: USBTransferSnapshot) {
+        scheduleUSBWatchdog()
         progress = transfer.fraction
         sentBytes = transfer.sentBytes
         totalBytes = transfer.totalBytes
@@ -2659,7 +2714,8 @@ struct ContentView: View {
     private func finishUSBTransfer() {
         guard isSending else { return }
 
-        USBBridgeServer.shared.disarm()
+        usbWatchdogToken = UUID()
+        USBBridgeServer.shared.endTransferCycle()
         if let current = activeQueueIndex, packageQueue.indices.contains(current) {
             let itemID = packageQueue[current].id
             queueCompletedItemIDs.insert(itemID)
@@ -2675,7 +2731,10 @@ struct ContentView: View {
         isSending = false
         UIApplication.shared.isIdleTimerDisabled = false
         saveHistory(completed: true)
-        status = t("USB transfer completed successfully.", "اكتمل نقل USB بنجاح.")
+        status = t(
+            "All PKG byte ranges were served to the PS4. Check the console for BGFT installation status.",
+            "تم إرسال جميع نطاقات بيانات PKG إلى PS4. تحقق من حالة التثبيت في الجهاز."
+        )
 
         if queueRunning, let current = activeQueueIndex {
             let next = current + 1
@@ -2695,7 +2754,10 @@ struct ContentView: View {
                     self.cleanupStagedPackages(finishedURLs)
                     self.packageQueue.removeAll()
                 }
-                status = t("Install queue completed successfully.", "اكتملت قائمة التثبيت بنجاح.")
+                status = t(
+                    "All queued PKG data was served. Check the PS4 for installation results.",
+                    "تم إرسال بيانات جميع الحزم. تحقق من نتائج التثبيت على PS4."
+                )
             }
         } else if let file = selectedFile {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
@@ -2977,8 +3039,8 @@ struct ContentView: View {
     private func cancelTransfer() {
 
         if transferMode == .usb {
-            USBBridgeServer.shared.disarm()
-            USBBridgeServer.shared.setTransferObserver(nil)
+            usbWatchdogToken = UUID()
+            USBBridgeServer.shared.endTransferCycle()
         }
 
         // Save history BEFORE
@@ -3873,6 +3935,7 @@ struct HistoryView: View {
 struct SettingsView: View {
     @Binding var appLanguage: String
     @Binding var psPort: String
+    @Binding var binLoaderPort: String
     @AppStorage("libraryAppearance") private var libraryAppearance = "minimalist"
     @AppStorage("appTheme") private var appTheme = "charcoal"
     @AppStorage("gameHubAppearance") private var gameHubAppearance = "original"
@@ -3895,8 +3958,15 @@ struct SettingsView: View {
                             settingsRow(icon: "globe", tint: .cyan, title: t("Language", "اللغة"), value: isArabic ? "العربية" : "English")
                         }
                         rowDivider
-                        NavigationLink { PlayStationSettings(psPort: $psPort, isArabic: isArabic) } label: {
-                            settingsRow(icon: "gamecontroller.fill", tint: .purple, title: t("PlayStation", "بلايستيشن"), value: "RPI")
+                        NavigationLink {
+                            PlayStationSettings(psPort: $psPort, binLoaderPort: $binLoaderPort, isArabic: isArabic)
+                        } label: {
+                            settingsRow(
+                                icon: "gamecontroller.fill",
+                                tint: .purple,
+                                title: t("PlayStation", "بلايستيشن"),
+                                value: "RPI \(psPort) · BL \(binLoaderPort)"
+                            )
                         }
                     }
 
@@ -4252,29 +4322,85 @@ private struct LanguageSettings: View {
 
 private struct PlayStationSettings: View {
     @Binding var psPort: String
+    @Binding var binLoaderPort: String
     let isArabic: Bool
-    @State private var draft = ""
-    @State private var showWarning = false
+
+    @State private var rpiDraft = ""
+    @State private var binLoaderDraft = ""
+
     private func t(_ en: String, _ ar: String) -> String { isArabic ? ar : en }
-    private var valid: Bool { Int(draft).map { (1...65535).contains($0) } ?? false }
+    private var validRPI: Bool { Int(rpiDraft).map { (1...65535).contains($0) } ?? false }
+    private var validBinLoader: Bool { Int(binLoaderDraft).map { (1...65535).contains($0) } ?? false }
+
     var body: some View {
         Form {
             Section {
-                HStack { Label(t("Port", "المنفذ"), systemImage: "network"); Spacer(); Text(psPort).foregroundStyle(.secondary) }
-                Button(t("Change Port", "تغيير المنفذ")) { draft = psPort; showWarning = true }
-                if psPort != "12800" { Button(t("Reset to 12800", "إعادة إلى 12800")) { psPort = "12800" } }
+                TextField(t("RPI port", "منفذ RPI"), text: $rpiDraft)
+                    .keyboardType(.numberPad)
+                HStack {
+                    Text(t("Active port", "المنفذ الحالي"))
+                    Spacer()
+                    Text(psPort).foregroundStyle(.secondary).monospacedDigit()
+                }
+                Button(t("Save RPI port", "حفظ منفذ RPI")) {
+                    if validRPI, let value = Int(rpiDraft) { psPort = String(value) }
+                }
+                .disabled(!validRPI)
+                if psPort != "12800" {
+                    Button(t("Reset to 12800", "إعادة إلى 12800")) {
+                        rpiDraft = "12800"
+                        psPort = "12800"
+                    }
+                }
             } header: {
-                Text(t("REMOTE PACKAGE INSTALLER", "REMOTE PACKAGE INSTALLER"))
+                Text(t("NETWORK · REMOTE PACKAGE INSTALLER", "الشبكة · REMOTE PACKAGE INSTALLER"))
             } footer: {
-                Text(t("12800 is the default RPI port. Change it only if your PlayStation service uses another port.", "12800 هو المنفذ الافتراضي لـ RPI. غيّره فقط إذا كانت الخدمة على البلايستيشن تستخدم منفذًا آخر."))
+                Text(t("This port is used only by Network mode. Default: 12800.", "يُستخدم هذا المنفذ في وضع الشبكة فقط. الافتراضي: 12800."))
+            }
+
+            Section {
+                TextField(t("GoldHEN BinLoader port", "منفذ GoldHEN BinLoader"), text: $binLoaderDraft)
+                    .keyboardType(.numberPad)
+                HStack {
+                    Text(t("Active port", "المنفذ الحالي"))
+                    Spacer()
+                    Text(binLoaderPort).foregroundStyle(.secondary).monospacedDigit()
+                }
+                Button(t("Save BinLoader port", "حفظ منفذ BinLoader")) {
+                    if validBinLoader, let value = Int(binLoaderDraft) { binLoaderPort = String(value) }
+                }
+                .disabled(!validBinLoader)
+                if binLoaderPort != "9090" {
+                    Button(t("Reset to 9090", "إعادة إلى 9090")) {
+                        binLoaderDraft = "9090"
+                        binLoaderPort = "9090"
+                    }
+                }
+            } header: {
+                Text(t("USB · PAYLOAD INJECTION", "USB · إرسال البايلود"))
+            } footer: {
+                Text(t("This TCP port sends pkgusb.elf to GoldHEN BinLoader. Default: 9090. It does not change the iPhone bridge port.", "هذا منفذ TCP لإرسال pkgusb.elf إلى GoldHEN BinLoader. الافتراضي: 9090. لا يغير منفذ جسر الآيفون."))
+            }
+
+            Section {
+                HStack {
+                    Text(t("iPhone PKG bridge", "جسر PKG للآيفون"))
+                    Spacer()
+                    Text("11112").foregroundStyle(.secondary).monospacedDigit()
+                }
+            } header: {
+                Text(t("PAYLOAD PROTOCOL", "بروتوكول البايلود"))
+            } footer: {
+                Text(t("The app listens on this fixed TCP port for HELLO, INFO, and READ commands from the bundled payload. Keep the app and payload protocol versions matched.", "يستمع التطبيق على منفذ TCP الثابت هذا لأوامر HELLO وINFO وREAD من البايلود المدمج. يجب أن تتوافق إصدارات التطبيق والبايلود."))
             }
         }
-        .navigationTitle(t("PlayStation", "بلايستيشن")).navigationBarTitleDisplayMode(.inline)
-        .alert(t("Change RPI Port", "تغيير منفذ RPI"), isPresented: $showWarning) {
-            TextField("12800", text: $draft).keyboardType(.numberPad)
-            Button(t("Cancel", "إلغاء"), role: .cancel) {}
-            Button(t("Save", "حفظ")) { if valid { psPort = String(Int(draft)!) } }.disabled(!valid)
-        } message: { Text(t("Only change this when you know RPI is listening on a different port.", "غيّر هذا فقط إذا كنت متأكدًا أن RPI يعمل على منفذ مختلف.")) }
+        .onAppear {
+            rpiDraft = psPort
+            binLoaderDraft = binLoaderPort
+        }
+        .navigationTitle(t("PlayStation", "بلايستيشن"))
+        .navigationBarTitleDisplayMode(.inline)
+        .environment(\.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
     }
 }
 

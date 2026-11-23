@@ -8,6 +8,7 @@ final class PayloadManager {
 
     enum PayloadError: LocalizedError {
         case invalidHost
+        case invalidPort
         case bundledPayloadMissing
         case customPayloadImportFailed(String)
         case readFailed(Error)
@@ -17,6 +18,7 @@ final class PayloadManager {
         var errorDescription: String? {
             switch self {
             case .invalidHost: return "Invalid PlayStation IP address."
+            case .invalidPort: return "Invalid GoldHEN BinLoader port. Use a value from 1 to 65535."
             case .bundledPayloadMissing: return "Built-in pkgusb.elf is missing from the app bundle."
             case .customPayloadImportFailed(let message): return "Could not import payload: \(message)"
             case .readFailed(let error): return "Could not read built-in payload: \(error.localizedDescription)"
@@ -114,9 +116,9 @@ final class PayloadManager {
             return
         }
 
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else {
+        guard port > 0, let nwPort = NWEndpoint.Port(rawValue: port) else {
             TransferDiagnostics.log("PAYLOAD ABORT invalid port=\(port)")
-            DispatchQueue.main.async { completion(.failure(PayloadError.invalidHost)) }
+            DispatchQueue.main.async { completion(.failure(PayloadError.invalidPort)) }
             return
         }
 

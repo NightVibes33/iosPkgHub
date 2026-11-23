@@ -4,6 +4,17 @@ import Darwin
 
 /// USB-side file service for PKG Sender. usbmux on the PS4 connects to this
 /// localhost TCP listener over Lightning; no Wi-Fi path is involved.
+enum USBBridgeServerError: LocalizedError {
+    case fileUnavailable(String)
+    case listenerFailed(String)
+    var errorDescription: String? {
+        switch self {
+        case .fileUnavailable(let name): return "Could not open the selected PKG file: \(name)"
+        case .listenerFailed(let message): return "USB bridge listener failed: \(message)"
+        }
+    }
+}
+
 struct USBTransferSnapshot {
     let fraction: Double
     let sentBytes: UInt64
@@ -17,6 +28,8 @@ final class USBBridgeServer {
 
     private let queue = DispatchQueue(label: "PKGSender.USBBridge", qos: .userInitiated)
     private var listener: NWListener?
+    private var listenerReady = false
+    private var pendingStartCompletions: [(Result<Void, Error>) -> Void] = []
     private var selectedURL: URL?
     private var selectedFD: Int32 = -1
     private var selectedSize: UInt64 = 0
@@ -48,14 +61,34 @@ final class USBBridgeServer {
         queue.async { [weak self] in self?.setSelectedFileLocked(url) }
     }
 
-    /// Arms the currently selected PKG for the USB payload. The payload may be
-    /// launched before or after this call; it polls INFO until the file is armed.
-    func armSelectedFile() {
+    /// Opens the selected PKG and waits for the bridge listener before arming it.
+    func prepareTransfer(
+        fileURL: URL,
+        observer: @escaping (USBTransferSnapshot) -> Void,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
         queue.async { [weak self] in
-            guard let self, self.selectedFD >= 0 else { return }
-            self.resetTransferMetricsLocked()
-            self.transferArmed = true
-            self.log("FILE armed for USB transfer")
+            guard let self else { return }
+            self.transferObserver = observer
+            self.setSelectedFileLocked(fileURL)
+            guard self.selectedFD >= 0 else {
+                DispatchQueue.main.async {
+                    completion(.failure(USBBridgeServerError.fileUnavailable(fileURL.lastPathComponent)))
+                }
+                return
+            }
+            self.startLocked { result in
+                switch result {
+                case .success:
+                    self.resetTransferMetricsLocked()
+                    self.transferArmed = true
+                    self.log("FILE armed for USB transfer")
+                    DispatchQueue.main.async { completion(.success(())) }
+                case .failure(let error):
+                    self.transferArmed = false
+                    DispatchQueue.main.async { completion(.failure(error)) }
+                }
+            }
         }
     }
 
@@ -77,20 +110,52 @@ final class USBBridgeServer {
         }
     }
 
-    private func startLocked() {
+    private func startLocked(completion: ((Result<Void, Error>) -> Void)? = nil) {
+        if listenerReady {
+            completion?(.success(()))
+            return
+        }
+        if let completion { pendingStartCompletions.append(completion) }
         guard listener == nil else { return }
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
-            let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
-            l.newConnectionHandler = { [weak self] c in self?.accept(c) }
-            l.stateUpdateHandler = { [weak self] s in self?.log("listener \(s)") }
-            listener = l
-            l.start(queue: queue)
-            log("READY localhost:\(port)")
+            let newListener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+            newListener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
+            newListener.stateUpdateHandler = { [weak self] state in
+                guard let self else { return }
+                switch state {
+                case .ready:
+                    self.listenerReady = true
+                    self.log("READY localhost:\(self.port)")
+                    self.finishStartCompletions(.success(()))
+                case .failed(let error):
+                    self.listenerReady = false
+                    self.listener = nil
+                    self.log("LISTENER ERROR \(error)")
+                    self.finishStartCompletions(.failure(USBBridgeServerError.listenerFailed(error.localizedDescription)))
+                case .cancelled:
+                    self.listenerReady = false
+                    self.listener = nil
+                    self.finishStartCompletions(.failure(USBBridgeServerError.listenerFailed("Listener was cancelled.")))
+                default:
+                    break
+                }
+            }
+            listener = newListener
+            newListener.start(queue: queue)
         } catch {
+            listener = nil
+            listenerReady = false
             log("LISTENER ERROR \(error)")
+            finishStartCompletions(.failure(USBBridgeServerError.listenerFailed(error.localizedDescription)))
         }
+    }
+
+    private func finishStartCompletions(_ result: Result<Void, Error>) {
+        let callbacks = pendingStartCompletions
+        pendingStartCompletions.removeAll()
+        callbacks.forEach { $0(result) }
     }
 
     private func closeSelectedFile() {
@@ -138,6 +203,12 @@ final class USBBridgeServer {
             if let error { self.log("CLIENT receive error \(error)"); c.cancel(); return }
             var b = buffer
             if let data { b.append(data) }
+            if b.count > 4096 {
+                self.log("CLIENT command exceeded 4096 bytes")
+                self.send(Data("ERR COMMAND\n".utf8), on: c)
+                c.cancel()
+                return
+            }
             while let nl = b.firstIndex(of: 0x0A) {
                 let lineData = b[..<nl]
                 b.removeSubrange(...nl)
@@ -169,6 +240,10 @@ final class USBBridgeServer {
         }
         if cmd == "READ", parts.count == 3,
            let off = UInt64(parts[1]), let requested = Int(parts[2]), requested > 0 {
+            guard transferArmed else {
+                send(Data("WAIT NOT_ARMED\n".utf8), on: c)
+                return
+            }
             guard selectedFD >= 0, off < selectedSize else {
                 send(Data("ERR RANGE\n".utf8), on: c); return
             }
@@ -180,14 +255,27 @@ final class USBBridgeServer {
             }
             guard got >= 0 else { send(Data("ERR READ \(errno)\n".utf8), on: c); return }
             if got < data.count { data.removeSubrange(got..<data.count) }
-            recordTransferredRangeLocked(offset: off, count: got)
-            // 19P: send the small protocol header separately so we do not copy
-            // the entire PKG chunk into a second combined Data allocation.
+            // Send the framing header first, then the body. Count the range only
+            // after Network.framework reports the body send as processed.
             let header = Data("DATA \(off) \(got)\n".utf8)
-            send(header, on: c)
-            if got > 0 {
-                send(data, on: c)
-            }
+            c.send(content: header, completion: .contentProcessed { [weak self] headerError in
+                if let headerError {
+                    self?.log("SEND header error \(headerError)")
+                    c.cancel()
+                    return
+                }
+                guard got > 0 else { return }
+                c.send(content: data, completion: .contentProcessed { [weak self] bodyError in
+                    if let bodyError {
+                        self?.log("SEND body error \(bodyError)")
+                        c.cancel()
+                        return
+                    }
+                    self?.queue.async { [weak self] in
+                        self?.recordTransferredRangeLocked(offset: off, count: got)
+                    }
+                })
+            })
             return
         }
         send(Data("ERR COMMAND\n".utf8), on: c)
@@ -209,7 +297,8 @@ final class USBBridgeServer {
     private func recordTransferredRangeLocked(offset: UInt64, count: Int) {
         guard transferArmed, count > 0, selectedSize > 0 else { return }
         let start = offset
-        let end = min(selectedSize, offset + UInt64(count))
+        let addition = offset.addingReportingOverflow(UInt64(count))
+        let end = min(selectedSize, addition.overflow ? selectedSize : addition.partialValue)
         guard end > start else { return }
 
         var mergedStart = start
@@ -274,7 +363,7 @@ final class USBBridgeServer {
 
         if fraction >= 1, !transferFinished {
             transferFinished = true
-            log("TRANSFER COMPLETE bytes=\(coveredBytes) speed=\(Int(smoothedSpeed)) B/s")
+            log("ALL PKG RANGES SERVED bytes=\(coveredBytes) speed=\(Int(smoothedSpeed)) B/s")
         }
     }
 
