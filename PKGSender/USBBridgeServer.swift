@@ -233,45 +233,61 @@ final class USBBridgeServer {
         receiveCommand(c, buffer: Data())
     }
 
-    private func receiveCommand(_ c: NWConnection, buffer: Data) {
-        c.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, complete, error in
-            guard let self else { return }
-            if let error { self.log("CLIENT receive error \(error)"); c.cancel(); return }
-            var pending = buffer
-            if let data { pending.append(data) }
+    private func receiveCommand(
+        _ c: NWConnection,
+        buffer: Data,
+        inputComplete: Bool = false
+    ) {
+        var pending = buffer
 
-            guard let newline = pending.firstIndex(of: 0x0A) else {
-                if pending.count > 4096 {
-                    self.log("CLIENT command exceeded 4096 bytes")
-                    self.send(Data("ERR COMMAND\n".utf8), on: c) { c.cancel() }
-                    return
-                }
-                if complete { self.log("CLIENT closed"); c.cancel(); return }
-                self.receiveCommand(c, buffer: pending)
-                return
-            }
-
+        // Drain buffered commands before receiving more bytes. A pipelined
+        // peer may have delivered several commands in one TCP packet.
+        if let newline = pending.firstIndex(of: 0x0A) {
             let lineData = pending[..<newline]
             pending.removeSubrange(...newline)
             guard lineData.count <= 4096 else {
-                self.log("CLIENT command exceeded 4096 bytes")
-                self.send(Data("ERR COMMAND\n".utf8), on: c) { c.cancel() }
+                log("CLIENT command exceeded 4096 bytes")
+                send(Data("ERR COMMAND\\n".utf8), on: c) { c.cancel() }
                 return
             }
-            let line = String(decoding: lineData, as: UTF8.self)
 
-            // Keep one response in flight per connection to preserve READ framing.
-            self.handle(line: line, on: c) {
-                if pending.count > 4096 {
-                    self.log("CLIENT command exceeded 4096 bytes")
-                    self.send(Data("ERR COMMAND\n".utf8), on: c) { c.cancel() }
-                } else if complete {
-                    self.log("CLIENT closed")
-                    c.cancel()
+            let line = String(decoding: lineData, as: UTF8.self)
+            handle(line: line, on: c) {
+                if inputComplete {
+                    if pending.isEmpty {
+                        self.log("CLIENT closed")
+                        c.cancel()
+                    } else {
+                        self.receiveCommand(c, buffer: pending, inputComplete: true)
+                    }
                 } else {
                     self.receiveCommand(c, buffer: pending)
                 }
             }
+            return
+        }
+
+        guard pending.count <= 4096 else {
+            log("CLIENT command exceeded 4096 bytes")
+            send(Data("ERR COMMAND\\n".utf8), on: c) { c.cancel() }
+            return
+        }
+        guard !inputComplete else {
+            log("CLIENT closed")
+            c.cancel()
+            return
+        }
+
+        c.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, complete, error in
+            guard let self else { return }
+            if let error {
+                self.log("CLIENT receive error \\(error)")
+                c.cancel()
+                return
+            }
+            var received = pending
+            if let data { received.append(data) }
+            self.receiveCommand(c, buffer: received, inputComplete: complete)
         }
     }
 
