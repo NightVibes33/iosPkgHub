@@ -2,15 +2,19 @@ import Foundation
 import Network
 import Darwin
 
-/// USB-side file service for PKG Sender. usbmux on the PS4 connects to this
-/// localhost TCP listener over Lightning; no Wi-Fi path is involved.
+/// iPhone-side file endpoint for the bundled PS4 payload. The payload enumerates
+/// the connected iPhone through sceUsbd, establishes its USBMUX v2 transport,
+/// then tunnels PKGBRIDGE/2 commands to this TCP listener over USB.
 enum USBBridgeServerError: LocalizedError {
     case fileUnavailable(String)
     case listenerFailed(String)
+
     var errorDescription: String? {
         switch self {
-        case .fileUnavailable(let name): return "Could not open the selected PKG file: \(name)"
-        case .listenerFailed(let message): return "USB bridge listener failed: \(message)"
+        case .fileUnavailable(let name):
+            return "Could not open the selected PKG file: \(name)"
+        case .listenerFailed(let message):
+            return "USB bridge listener failed: \(message)"
         }
     }
 }
@@ -36,8 +40,8 @@ final class USBBridgeServer {
     private var selectedSize: UInt64 = 0
     private var hasSecurityScope = false
     private var transferArmed = false
-    private var coveredRanges: [(UInt64, UInt64)] = []
-    private var coveredBytes: UInt64 = 0
+    private var activeTransferID: UUID?
+    private var byteCoverage = ByteRangeCoverage()
     private var transferStartedAt: Date?
     private var lastSampleAt: Date?
     private var lastSampleBytes: UInt64 = 0
@@ -62,31 +66,41 @@ final class USBBridgeServer {
         queue.async { [weak self] in self?.setSelectedFileLocked(url) }
     }
 
-    /// Opens the selected PKG and waits for the bridge listener before arming it.
+    /// Opens the selected file, waits until the listener is ready, and only then
+    /// arms INFO/READ requests from the PS4 payload.
     func prepareTransfer(
         fileURL: URL,
+        transferID: UUID,
         observer: @escaping (USBTransferSnapshot) -> Void,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.transferObserver = observer
             self.setSelectedFileLocked(fileURL)
+            self.activeTransferID = transferID
+            self.transferObserver = observer
+
             guard self.selectedFD >= 0, self.selectedSize > 0 else {
-                DispatchQueue.main.async {
-                    completion(.failure(USBBridgeServerError.fileUnavailable(fileURL.lastPathComponent)))
-                }
+                self.activeTransferID = nil
+                self.transferObserver = nil
+                let error = USBBridgeServerError.fileUnavailable(fileURL.lastPathComponent)
+                DispatchQueue.main.async { completion(.failure(error)) }
                 return
             }
+
             self.startLocked { result in
                 switch result {
                 case .success:
+                    guard self.activeTransferID == transferID else { return }
                     self.resetTransferMetricsLocked()
                     self.transferArmed = true
                     self.log("FILE armed for USB transfer")
                     DispatchQueue.main.async { completion(.success(())) }
                 case .failure(let error):
+                    guard self.activeTransferID == transferID else { return }
                     self.transferArmed = false
+                    self.activeTransferID = nil
+                    self.transferObserver = nil
                     DispatchQueue.main.async { completion(.failure(error)) }
                 }
             }
@@ -99,13 +113,13 @@ final class USBBridgeServer {
         }
     }
 
-    /// Ends one USB transfer cleanly while keeping the localhost listener alive
-    /// for the next payload. Releases the file descriptor/security scope and
-    /// removes the progress observer so the next send starts from a clean state.
+    /// Ends one USB transfer, closes the localhost listener, and releases the
+    /// file descriptor/security scope before the next transfer cycle.
     func endTransferCycle() {
         queue.async { [weak self] in
             guard let self else { return }
             self.transferArmed = false
+            self.activeTransferID = nil
             self.transferObserver = nil
             self.closeSelectedFile()
             self.stopListenerLocked()
@@ -117,8 +131,13 @@ final class USBBridgeServer {
             completion?(.success(()))
             return
         }
-        if let completion { pendingStartCompletions.append(completion) }
+
+        if let completion {
+            pendingStartCompletions.append(completion)
+        }
+
         guard listener == nil else { return }
+
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
@@ -127,24 +146,37 @@ final class USBBridgeServer {
             }
             let generation = UUID()
             listenerGeneration = generation
+            // USBMUX forwards the device-side port to loopback. Binding only
+            // to 127.0.0.1 prevents peers on Wi-Fi/LAN from reading selected PKGs.
+            params.requiredLocalEndpoint = .hostPort(
+                host: NWEndpoint.Host("127.0.0.1"),
+                port: listenPort
+            )
             let newListener = try NWListener(using: params, on: listenPort)
-            newListener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
+            newListener.newConnectionHandler = { [weak self] connection in
+                guard let self, self.listenerGeneration == generation else { return }
+                self.accept(connection)
+            }
             newListener.stateUpdateHandler = { [weak self] state in
                 guard let self, self.listenerGeneration == generation else { return }
                 switch state {
                 case .ready:
                     self.listenerReady = true
-                    self.log("READY localhost:\(self.port)")
+                    self.log("READY tcp port=\(self.port)")
                     self.finishStartCompletions(.success(()))
                 case .failed(let error):
                     self.listenerReady = false
                     self.listener = nil
                     self.log("LISTENER ERROR \(error)")
-                    self.finishStartCompletions(.failure(USBBridgeServerError.listenerFailed(error.localizedDescription)))
+                    self.finishStartCompletions(.failure(
+                        USBBridgeServerError.listenerFailed(error.localizedDescription)
+                    ))
                 case .cancelled:
                     self.listenerReady = false
                     self.listener = nil
-                    self.finishStartCompletions(.failure(USBBridgeServerError.listenerFailed("Listener was cancelled.")))
+                    self.finishStartCompletions(.failure(
+                        USBBridgeServerError.listenerFailed("The listener was cancelled.")
+                    ))
                 default:
                     break
                 }
@@ -155,7 +187,9 @@ final class USBBridgeServer {
             listener = nil
             listenerReady = false
             log("LISTENER ERROR \(error)")
-            finishStartCompletions(.failure(USBBridgeServerError.listenerFailed(error.localizedDescription)))
+            finishStartCompletions(.failure(
+                USBBridgeServerError.listenerFailed(error.localizedDescription)
+            ))
         }
     }
 
@@ -183,6 +217,7 @@ final class USBBridgeServer {
         selectedSize = 0
         hasSecurityScope = false
         transferArmed = false
+        activeTransferID = nil
         resetTransferMetricsLocked()
     }
 
@@ -215,70 +250,107 @@ final class USBBridgeServer {
         receiveCommand(c, buffer: Data())
     }
 
-    private func receiveCommand(_ c: NWConnection, buffer: Data) {
+    private func receiveCommand(
+        _ c: NWConnection,
+        buffer: Data,
+        inputComplete: Bool = false
+    ) {
+        var pending = buffer
+
+        // Drain buffered commands before receiving more bytes. A pipelined
+        // peer may have delivered several commands in one TCP packet.
+        if let newline = pending.firstIndex(of: 0x0A) {
+            let lineData = pending[..<newline]
+            pending.removeSubrange(...newline)
+            guard lineData.count <= 4096 else {
+                log("CLIENT command exceeded 4096 bytes")
+                send(Data("ERR COMMAND\\n".utf8), on: c) { c.cancel() }
+                return
+            }
+
+            let line = String(decoding: lineData, as: UTF8.self)
+            handle(line: line, on: c) {
+                if inputComplete {
+                    if pending.isEmpty {
+                        self.log("CLIENT closed")
+                        c.cancel()
+                    } else {
+                        self.receiveCommand(c, buffer: pending, inputComplete: true)
+                    }
+                } else {
+                    self.receiveCommand(c, buffer: pending)
+                }
+            }
+            return
+        }
+
+        guard pending.count <= 4096 else {
+            log("CLIENT command exceeded 4096 bytes")
+            send(Data("ERR COMMAND\\n".utf8), on: c) { c.cancel() }
+            return
+        }
+        guard !inputComplete else {
+            log("CLIENT closed")
+            c.cancel()
+            return
+        }
+
         c.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [weak self] data, _, complete, error in
             guard let self else { return }
-            if let error { self.log("CLIENT receive error \(error)"); c.cancel(); return }
-            var b = buffer
-            if let data { b.append(data) }
-            if b.count > 4096 {
-                self.log("CLIENT command exceeded 4096 bytes")
-                self.send(Data("ERR COMMAND\n".utf8), on: c)
+            if let error {
+                self.log("CLIENT receive error \\(error)")
                 c.cancel()
                 return
             }
-            while let nl = b.firstIndex(of: 0x0A) {
-                let lineData = b[..<nl]
-                b.removeSubrange(...nl)
-                let line = String(decoding: lineData, as: UTF8.self)
-                self.handle(line: line, on: c)
-            }
-            if complete { self.log("CLIENT closed"); c.cancel(); return }
-            self.receiveCommand(c, buffer: b)
+            var received = pending
+            if let data { received.append(data) }
+            self.receiveCommand(c, buffer: received, inputComplete: complete)
         }
     }
 
-    private func handle(line: String, on c: NWConnection) {
+    private func handle(line: String, on c: NWConnection, completion: @escaping () -> Void) {
         let parts = line.split(separator: " ")
-        guard let cmd = parts.first else { return }
+        guard let cmd = parts.first else { completion(); return }
+
         if cmd == "HELLO" {
-            send(Data("PKGBRIDGE/2 READY\n".utf8), on: c)
+            send(Data("PKGBRIDGE/2 READY\n".utf8), on: c, completion: completion)
             return
         }
         if cmd == "INFO" {
             guard selectedFD >= 0, let url = selectedURL else {
-                send(Data("ERR NO_FILE\n".utf8), on: c); return
+                send(Data("ERR NO_FILE\n".utf8), on: c, completion: completion); return
             }
             guard transferArmed else {
-                send(Data("WAIT NOT_ARMED\n".utf8), on: c); return
+                send(Data("WAIT NOT_ARMED\n".utf8), on: c, completion: completion); return
             }
             let safeName = url.lastPathComponent.replacingOccurrences(of: "\n", with: "_")
-            send(Data("OK \(selectedSize) \(safeName)\n".utf8), on: c)
+            send(Data("OK \(selectedSize) \(safeName)\n".utf8), on: c, completion: completion)
             return
         }
         if cmd == "READ", parts.count == 3,
            let off = UInt64(parts[1]), let requested = Int(parts[2]), requested > 0 {
-            guard transferArmed else {
-                send(Data("WAIT NOT_ARMED\n".utf8), on: c)
+            guard transferArmed, let requestTransferID = activeTransferID else {
+                send(Data("WAIT NOT_ARMED\n".utf8), on: c, completion: completion)
                 return
             }
             guard selectedFD >= 0, off < selectedSize else {
-                send(Data("ERR RANGE\n".utf8), on: c); return
+                send(Data("ERR RANGE\n".utf8), on: c, completion: completion)
+                return
             }
+
             let count = min(requested, 16 * 1024 * 1024, Int(selectedSize - off))
             var data = Data(count: count)
             let got: Int = data.withUnsafeMutableBytes { raw in
-                guard let p = raw.baseAddress else { return -1 }
-                return Darwin.pread(selectedFD, p, count, off_t(off))
+                guard let base = raw.baseAddress else { return -1 }
+                return Darwin.pread(selectedFD, base, count, off_t(off))
             }
             guard got > 0 else {
                 let code = got < 0 ? errno : EIO
-                send(Data("ERR READ \(code)\n".utf8), on: c)
+                send(Data("ERR READ \(code)\n".utf8), on: c, completion: completion)
                 return
             }
             if got < data.count { data.removeSubrange(got..<data.count) }
-            // Send the framing header first, then the body. Count the range only
-            // after Network.framework reports the body send as processed.
+
             let header = Data("DATA \(off) \(got)\n".utf8)
             c.send(content: header, completion: .contentProcessed { [weak self] headerError in
                 if let headerError {
@@ -286,26 +358,27 @@ final class USBBridgeServer {
                     c.cancel()
                     return
                 }
-                guard got > 0 else { return }
                 c.send(content: data, completion: .contentProcessed { [weak self] bodyError in
                     if let bodyError {
                         self?.log("SEND body error \(bodyError)")
                         c.cancel()
                         return
                     }
-                    self?.queue.async { [weak self] in
-                        self?.recordTransferredRangeLocked(offset: off, count: got)
+                    guard let self else { completion(); return }
+                    self.queue.async {
+                        self.recordTransferredRangeLocked(offset: off, count: got, transferID: requestTransferID)
+                        completion()
                     }
                 })
             })
             return
         }
-        send(Data("ERR COMMAND\n".utf8), on: c)
+
+        send(Data("ERR COMMAND\n".utf8), on: c, completion: completion)
     }
 
     private func resetTransferMetricsLocked() {
-        coveredRanges.removeAll(keepingCapacity: true)
-        coveredBytes = 0
+        byteCoverage.reset()
         transferStartedAt = nil
         lastSampleAt = nil
         lastSampleBytes = 0
@@ -313,39 +386,12 @@ final class USBBridgeServer {
         transferFinished = false
     }
 
-    /// Counts unique file bytes requested by the PS4 payload. BGFT performs a few
-    /// probe/retry reads and parallel ranges, so simply summing READ sizes would
-    /// over-report progress. Merging ranges keeps progress monotonic and accurate.
-    private func recordTransferredRangeLocked(offset: UInt64, count: Int) {
-        guard transferArmed, count > 0, selectedSize > 0 else { return }
-        let start = offset
-        let addition = offset.addingReportingOverflow(UInt64(count))
-        let end = min(selectedSize, addition.overflow ? selectedSize : addition.partialValue)
-        guard end > start else { return }
-
-        var mergedStart = start
-        var mergedEnd = end
-        var result: [(UInt64, UInt64)] = []
-        result.reserveCapacity(coveredRanges.count + 1)
-        var inserted = false
-
-        for range in coveredRanges {
-            if range.1 < mergedStart {
-                result.append(range)
-            } else if mergedEnd < range.0 {
-                if !inserted {
-                    result.append((mergedStart, mergedEnd))
-                    inserted = true
-                }
-                result.append(range)
-            } else {
-                mergedStart = min(mergedStart, range.0)
-                mergedEnd = max(mergedEnd, range.1)
-            }
-        }
-        if !inserted { result.append((mergedStart, mergedEnd)) }
-        coveredRanges = result
-        coveredBytes = coveredRanges.reduce(0) { $0 + ($1.1 - $1.0) }
+    /// Counts unique file bytes only after the corresponding response body has
+    /// completed its Network.framework send callback.
+    private func recordTransferredRangeLocked(offset: UInt64, count: Int, transferID: UUID) {
+        guard transferArmed, activeTransferID == transferID, count > 0, selectedSize > 0 else { return }
+        byteCoverage.add(start: offset, length: UInt64(count), limit: selectedSize)
+        let coveredBytes = byteCoverage.coveredBytes
 
         let now = Date()
         if transferStartedAt == nil {
@@ -360,7 +406,9 @@ final class USBBridgeServer {
                 let delta = coveredBytes >= lastSampleBytes ? coveredBytes - lastSampleBytes : 0
                 let instant = dt > 0 ? Double(delta) / dt : 0
                 if instant > 0 {
-                    smoothedSpeed = smoothedSpeed > 0 ? (smoothedSpeed * 0.72 + instant * 0.28) : instant
+                    smoothedSpeed = smoothedSpeed > 0
+                        ? (smoothedSpeed * 0.72 + instant * 0.28)
+                        : instant
                 }
                 lastSampleAt = now
                 lastSampleBytes = coveredBytes
@@ -368,30 +416,35 @@ final class USBBridgeServer {
         }
 
         let fraction = min(1, Double(coveredBytes) / Double(selectedSize))
-        let remaining: Double?
-        if smoothedSpeed > 0 {
-            remaining = Double(selectedSize - min(coveredBytes, selectedSize)) / smoothedSpeed
-        } else {
-            remaining = nil
-        }
-        let snapshot = USBTransferSnapshot(
+        let remaining = smoothedSpeed > 0
+            ? Double(selectedSize - min(coveredBytes, selectedSize)) / smoothedSpeed
+            : nil
+
+        transferObserver?(USBTransferSnapshot(
             fraction: fraction,
             sentBytes: min(coveredBytes, selectedSize),
             totalBytes: selectedSize,
             bytesPerSecond: smoothedSpeed,
             remainingSeconds: remaining
-        )
-        transferObserver?(snapshot)
+        ))
 
         if fraction >= 1, !transferFinished {
             transferFinished = true
-            log("ALL PKG RANGES SERVED bytes=\(coveredBytes) speed=\(Int(smoothedSpeed)) B/s")
+            log("TRANSFER COMPLETE bytes=\(coveredBytes) speed=\(Int(smoothedSpeed)) B/s")
         }
     }
 
-    private func send(_ data: Data, on c: NWConnection) {
+    private func send(
+        _ data: Data,
+        on c: NWConnection,
+        completion: @escaping () -> Void = {}
+    ) {
         c.send(content: data, completion: .contentProcessed { [weak self] error in
-            if let error { self?.log("SEND error \(error)") }
+            if let error {
+                self?.log("SEND error \(error)")
+                c.cancel()
+            }
+            completion()
         })
     }
 

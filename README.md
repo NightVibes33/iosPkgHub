@@ -1,24 +1,42 @@
 # PKG Sender
 
-Native iOS app for managing and sending PlayStation 4 PKG files through Remote Package Installer (network mode) or the included payload bridge (USB mode).
+Native iPhone and iPad app for sending PS4 PKG files through Remote Package Installer (network mode) or the bundled GoldHEN USBMUX payload (USB mode).
 
-**iOS 16+ · Xcode 27 / macOS 27 CI · English and Arabic · Network + USB**
+[![Build iOS 27 unsigned IPA](https://github.com/NightVibes33/iosPkgHub/actions/workflows/build.yml/badge.svg)](https://github.com/NightVibes33/iosPkgHub/actions/workflows/build.yml)
 
-- [Builds and unsigned IPA artifacts](https://github.com/NightVibes33/iosPkgHub/actions/workflows/build.yml)
-- [Repository](https://github.com/NightVibes33/iosPkgHub)
+**iOS 16+ · iOS 27 / Xcode 27 CI · English and Arabic · Network + USB**
+
+- [Actions builds and unsigned IPA artifacts](https://github.com/NightVibes33/iosPkgHub/actions/workflows/build.yml)
 - [Releases](https://github.com/NightVibes33/iosPkgHub/releases)
+- [Source repository](https://github.com/NightVibes33/iosPkgHub)
+
+---
+
+## Screenshots
+
+| Home — Network | Home — USB |
+| --- | --- |
+| <img src="assets/home-network.jpg" width="320"> | <img src="assets/home-usb.jpg" width="320"> |
+
+| Library | Game Hub |
+| --- | --- |
+| <img src="assets/library.jpg" width="320"> | <img src="assets/game-hub.jpg" width="320"> |
+
+| Transfer History |
+| --- |
+| <img src="assets/history-usb.jpg" width="320"> |
 
 ## Features
 
-- Network package transfer through PS4 Remote Package Installer (RPI).
-- USB bridge mode using the bundled `pkgusb.elf` payload.
-- GAME, UPDATE, and DLC package metadata.
+- Network transfers through PS4 Remote Package Installer (RPI).
+- USB transfers through the bundled PS4 payload and the iPhone-side USBMUX bridge.
+- GAME, UPDATE, and DLC package metadata support.
 - Local PKG library, artwork, and Game Hub.
-- Multi-package queue, transfer progress, speed, and ETA.
-- Transfer history and diagnostics.
+- Multi-package queue, progress, speed, and ETA.
+- Transfer history with file size, transferred bytes, transfer method, and timing.
 - GoldHEN FTP tools.
-- English and Arabic interface.
-- PKG files are transferred locally, not uploaded to a cloud service.
+- Arabic and English interface.
+- Local-only package transfer. PKG files are not uploaded to a cloud service.
 
 ## Transfer modes
 
@@ -27,95 +45,106 @@ Native iOS app for managing and sending PlayStation 4 PKG files through Remote P
 Network mode uses PS4 Remote Package Installer.
 
 1. Start Remote Package Installer on the PS4.
-2. Connect the iPhone and PS4 to a network where they can reach one another.
+2. Put the iPhone/iPad and PS4 on a network where they can reach each other.
 3. Enter the PS4 IP address.
-4. Set the RPI port in **Settings → PlayStation**. The default is `12800`.
-5. Select a PKG and send it.
+4. Set the RPI port in **Settings → PlayStation**. The default is \`12800\`.
+5. Tap **Check Connection**, select a PKG, and send.
 
-The iPhone hosts the selected PKG over HTTP. The app submits the package URL to RPI using `POST /api/install`. The local HTTP listener uses an operating-system-selected port, except the iPhone Personal Hotspot path, which uses port `8080`.
+The iPhone hosts the PKG over HTTP. The app advertises the local HTTP URL to RPI, which retrieves the package using byte-range requests. The iPhone's HTTP listening port is selected by the operating system for normal network mode; it is not the RPI port.
 
-Progress is calculated from unique byte ranges sent by the iPhone. Repeated, overlapping, and out-of-order range requests are not counted twice.
+When the iPhone Personal Hotspot path is selected, the app uses its dedicated HTTP server on port \`8080\`.
 
 ### USB mode
 
-USB mode is not ordinary USB mass-storage copying. The app includes a prebuilt PS4 ELF payload named `pkgusb.elf` and implements the iPhone-side TCP protocol endpoint.
+USB mode uses a custom payload included as \`pkgusb.elf\`. The payload is not a generic USB mass-storage copy operation.
 
-The iPhone app starts its TCP bridge on port `11112` for an active transfer and closes the listener when that transfer cycle ends. Its bridge understands these newline-delimited commands:
+The bundled ELF was inspected as a 64-bit little-endian x86-64 PS4 ELF. Its embedded strings and symbols identify the following components:
 
-- `HELLO` → `PKGBRIDGE/2 READY`
-- `INFO` → package size and filename, once a transfer is armed
-- `READ <offset> <length>` → `DATA <offset> <length>` followed by that byte range
+- PS4 USB host operations through \`sceUsbd\` (device enumeration, interface configuration, and bulk transfers).
+- A USBMUX v2 transport for communicating with the connected iPhone.
+- A connection to the iPhone-side TCP bridge on port \`11112\`.
+- A PS4-side HTTP proxy for the BGFT install task, normally using port \`11113\` (the payload can select another isolated port if that listener is already occupied).
+- Direct BGFT package registration and install-task startup.
 
-The bundled ELF is a binary-only dependency in this repository. Its source code is not included, so its USB enumeration, USBMUX implementation, and end-to-end compatibility cannot be audited from the Swift source alone. For USB mode to work, the payload must establish the matching connection to the iPhone bridge and speak the protocol above.
+The data path is:
+
+1. PKG Sender opens the selected package and starts its iPhone-side bridge on TCP \`11112\`. The loopback-only listener closes when that transfer cycle ends.
+2. The app injects \`pkgusb.elf\` into GoldHEN BinLoader over TCP. The default BinLoader port is \`9090\` and can be changed in **Settings → PlayStation**.
+3. The PS4 payload enumerates the connected iPhone through its USB host controller and establishes the payload's USBMUX v2 bridge.
+4. The payload requests package information and byte ranges from the iPhone bridge using the \`PKGBRIDGE/2\` protocol.
+5. The payload exposes the package to the PS4 BGFT installer through its internal HTTP proxy.
+
+**Important:** the initial payload injection still requires the PS4 IP address and a reachable BinLoader TCP port. After the payload starts, the PKG data path uses the physical USB connection. USB mode is therefore not a completely network-free setup.
 
 #### USB ports
 
-| Port | Side | Purpose | Setting |
+| Port | Side | Purpose | User-configurable |
 | --- | --- | --- | --- |
-| `9090` | PS4 | GoldHEN BinLoader payload injection | Configurable |
-| `11112` | iPhone | PKGBRIDGE/2 TCP listener | Fixed by app/payload protocol |
-| `12800` | PS4 | Remote Package Installer | Configurable |
+| \`9090\` | PS4 | GoldHEN BinLoader payload injection | Yes |
+| \`11112\` | iPhone | USBMUX / PKGBRIDGE TCP endpoint | No, fixed by the payload protocol |
+| \`11113\` | PS4 | Internal BGFT HTTP proxy | Payload-managed |
+| \`12800\` | PS4 | Remote Package Installer for Network mode | Yes |
 
-The app does not let you change port `11112` independently because the bundled payload must use the same endpoint.
+Do not change the iPhone bridge port independently of the bundled ELF. The iPhone bridge and PS4 payload must use the same protocol and port.
 
 #### USB setup
 
 1. Enable GoldHEN and its BinLoader on the PS4.
 2. Confirm the PS4 IP address is reachable from the iPhone for the initial payload injection.
-3. Connect the iPhone directly to a PS4 USB data port using a data-capable cable.
-4. Open PKG Sender, select **USB**, choose a PKG, and tap **Send to PlayStation**.
-5. Keep PKG Sender open while the payload requests the package.
+3. Connect the iPhone directly to a PS4 USB data port with a data-capable cable.
+4. Open PKG Sender and select **USB**.
+5. Choose the PKG and tap **Send to PlayStation**.
+6. Keep PKG Sender in the foreground while the payload reads the package.
 
-The initial ELF injection is sent over TCP to the configured BinLoader port. The package-data path is expected to use the payload's USB bridge. USB mode is therefore not completely network-free.
+A charge-only cable will not work. If the bridge does not connect, check the cable, USB connection, BinLoader port, and the PS4 payload diagnostics.
 
-#### USB progress and completion
+#### What 100% means
 
-The iPhone counts unique PKG byte ranges only after the corresponding Network.framework send callbacks complete. Repeated, overlapping, and out-of-order reads do not inflate progress.
+USB progress is calculated from unique package byte ranges after the iPhone's Network.framework send callbacks complete. Duplicate and out-of-order range reads are counted only once.
 
-A 100% byte counter means all unique PKG ranges have been processed by the iPhone-side bridge. It is **not** a BGFT installation-success acknowledgment. Confirm the final install result on the PS4 itself.
-
-If no package data arrives for three minutes after payload injection, the app stops the transfer and reports a stalled bridge instead of leaving the UI spinning forever.
+Reaching 100% means all unique PKG byte ranges have been served through the bridge. It does **not** mean the app has received a final BGFT installation-success acknowledgment. Confirm the final installation state on the PS4.
 
 ## Port settings
 
-Open **Settings → PlayStation**:
+Open **Settings → PlayStation** to edit:
 
-- **RPI port** controls network-mode Remote Package Installer. Default: `12800`.
-- **BinLoader port** controls the TCP connection used to inject `pkgusb.elf`. Default: `9090`.
-- **iPhone bridge port** is fixed at `11112` to match the bridge protocol.
+- **RPI port**: network-mode Remote Package Installer, default \`12800\`.
+- **BinLoader port**: USB payload injection, default \`9090\`.
 
-Changing the RPI port does not change the BinLoader or iPhone bridge ports.
+The USBMUX bridge port \`11112\` and PS4 internal proxy port \`11113\` are shown as read-only because they are part of the payload protocol.
 
 ## Requirements
 
 ### General
 - iPhone or iPad running iOS 16 or later.
-- A compatible PS4 environment.
+- Compatible PS4 environment.
 - A compatible installation method for an unsigned IPA.
 
-### Network
+### Network mode
 - Remote Package Installer running on the PS4.
 - iPhone and PS4 can communicate over the local network.
 
-### USB
-- GoldHEN with BinLoader enabled and reachable for initial payload injection.
-- A direct, data-capable USB connection.
-- A payload build compatible with the app's `PKGBRIDGE/2` protocol.
+### USB mode
+- GoldHEN with BinLoader enabled and reachable for the initial payload injection.
+- A direct, data-capable USB cable between the iPhone/iPad and PS4.
+- Keep PKG Sender active during the transfer.
 
-## Install
+## Installation
 
-Download the latest successful **PKGSender iOS 27 unsigned IPA** from the [GitHub Actions workflow](https://github.com/NightVibes33/iosPkgHub/actions/workflows/build.yml), open the successful run, then download its artifact.
+The GitHub Actions workflow builds an **unsigned** iOS device IPA. Download the artifact from the latest successful [Actions run](https://github.com/NightVibes33/iosPkgHub/actions/workflows/build.yml).
 
-The IPA is deliberately unsigned and has no Apple distribution signature or provisioning profile. It must be installed through a compatible signing/sideloading method or an environment that accepts unsigned app bundles. It will not install on a stock iPhone simply by opening the IPA.
+An unsigned IPA has no Apple distribution signature or provisioning profile. It must be installed using a compatible signing/sideloading method or an environment that accepts unsigned app bundles. It is not directly installable on a stock, non-jailbroken iPhone merely by opening the file.
 
 ## Build from source
 
+The project uses Swift, SwiftUI, and XcodeGen.
+
 ### Requirements
-- macOS 27 with Xcode 27 and the iOS 27 SDK.
+- macOS with Xcode 27 and the iOS 27 SDK.
 - XcodeGen.
 
 ### Generate and test
-```sh
+~~~sh
 brew install xcodegen
 xcodegen generate
 
@@ -124,10 +153,10 @@ xcodebuild test \
   -scheme PKGSender \
   -destination 'platform=iOS Simulator,name=iPhone 17,OS=latest' \
   CODE_SIGNING_ALLOWED=NO
-```
+~~~
 
-### Build the unsigned device app
-```sh
+### Build an unsigned device app
+~~~sh
 xcodebuild build \
   -project PKGSender.xcodeproj \
   -scheme PKGSender \
@@ -137,31 +166,45 @@ xcodebuild build \
   CODE_SIGNING_ALLOWED=NO \
   CODE_SIGNING_REQUIRED=NO \
   CODE_SIGN_IDENTITY=""
-```
+~~~
 
-The GitHub Actions workflow uses the `xcode-27` hosted runner, which provides macOS 27 and Xcode 27 on Apple Silicon. It verifies the iOS SDK, runs byte-range unit tests on an iOS 27 simulator, builds the Release device app without code signing, checks the bundled payload hash and app bundle, and uploads a validated IPA plus build metadata.
+To package the resulting \`PKGSender.app\`, place it inside a folder named \`Payload\` and ZIP that folder with the \`.ipa\` extension. The repository's GitHub Actions workflow performs this packaging, validates the archive, and verifies the bundled payload SHA-256.
 
-CI can validate compilation, unit tests, bundle packaging, and payload integrity. It cannot prove a physical iPhone-to-PS4 USB transfer or BGFT installation. Those still require the actual console, phone, cable, and compatible payload.
+### CI verification
+
+The \`xcode-27\` GitHub-hosted runner uses macOS 27 and Xcode 27. The workflow:
+
+- Verifies the macOS and iOS SDK versions.
+- Generates the Xcode project.
+- Runs the byte-range coverage unit tests on an iOS 27 simulator.
+- Builds the Release iOS device app without code signing.
+- Verifies the app bundle, Info.plist, and bundled ELF hash.
+- Packages and validates the unsigned IPA.
+- Uploads the IPA and build metadata as a 30-day workflow artifact.
+
+CI cannot validate the physical iPhone-to-PS4 USB link or complete a real BGFT installation. Those require the actual devices and cable.
 
 ## Diagnostics
 
-The app writes USB bridge diagnostics to:
+The app includes a diagnostics screen and writes transfer diagnostics locally. For USB issues, capture the app's USB bridge log and the PS4 payload log at:
 
-- iPhone: `Documents/PKGSender-USBBridge.log`
+- iPhone app: \`Documents/PKGSender-USBBridge.log\`
+- PS4 payload: \`/data/pkg-usb-payload.log\` and \`/mnt/usb0/pkg-usb-payload.log\`
 
-The PS4 payload is a prebuilt binary, so its own diagnostic paths and messages depend on that payload build. Do not assume a particular PS4 log path unless the payload documents or emits it.
-
-For a USB failure, separate the stages:
-1. BinLoader TCP connection and ELF injection.
-2. USB payload startup and iPhone device/bridge connection.
-3. `HELLO` protocol handshake on port `11112`.
-4. `INFO` response for the selected package.
-5. `READ` responses and byte-range progress.
+Useful failure points include:
+- BinLoader connection failure on the configured port.
+- USB device enumeration or interface-claim failure.
+- USBMUX bridge initialization failure.
+- iPhone TCP bridge connection failure on \`11112\`.
+- PS4 HTTP proxy bind failure.
+- BGFT metadata or install-task failure.
 
 ## Privacy
 
-Package files are served locally between the iPhone and PS4. The app does not upload PKG files to a cloud service. Library data and transfer history are stored on the device.
+Package data is transferred locally between the iPhone and PS4. The app does not upload PKG files to a cloud service. Library data, metadata, and transfer history are stored on the device.
 
 ## Credits
 
-This repository preserves the existing app and source structure. PKG Sender is an independent project and is not affiliated with Sony Interactive Entertainment.
+The app credits the original project author, T2oDna. Repository maintenance and this repair work are tracked in [NightVibes33/iosPkgHub](https://github.com/NightVibes33/iosPkgHub).
+
+PKG Sender is an independent project and is not affiliated with Sony Interactive Entertainment.

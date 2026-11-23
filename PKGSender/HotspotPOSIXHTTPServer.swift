@@ -188,8 +188,10 @@ final class HotspotPOSIXHTTPServer: PKGHTTPServing {
                     return Darwin.send(client, base.advanced(by: sent), n - sent, 0)
                 }
                 if w <= 0 { return }
-                sent += w; offset += UInt64(w)
-                record(position: offset, bytes: UInt64(w))
+                let sentRangeStart = offset
+                sent += w
+                offset += UInt64(w)
+                record(start: sentRangeStart, bytes: UInt64(w))
             }
         }
     }
@@ -208,16 +210,18 @@ final class HotspotPOSIXHTTPServer: PKGHTTPServing {
         }
     }
 
-    private func record(position: UInt64, bytes: UInt64) {
+    private func record(start: UInt64, bytes: UInt64) {
         queue.async { [weak self] in
             guard let self = self else { return }
-            if position >= bytes {
-                self.byteCoverage.add(start: position - bytes, length: bytes, limit: self.fileSize)
-            }
+            self.byteCoverage.add(start: start, length: bytes, limit: self.fileSize)
             self.totalWireBytes += bytes
             let elapsed = max(Date().timeIntervalSince(self.speedStartedAt), 0.001)
             let speed = Double(self.totalWireBytes) / elapsed
-            let p = LocalHTTPServer.TransferProgress(sentBytes: min(self.byteCoverage.coveredBytes, self.fileSize), totalBytes: self.fileSize, bytesPerSecond: speed)
+            let p = LocalHTTPServer.TransferProgress(
+                sentBytes: min(self.byteCoverage.coveredBytes, self.fileSize),
+                totalBytes: self.fileSize,
+                bytesPerSecond: speed
+            )
             DispatchQueue.main.async { self.onProgress(p) }
         }
     }
