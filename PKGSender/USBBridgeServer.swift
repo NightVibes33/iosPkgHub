@@ -29,6 +29,7 @@ final class USBBridgeServer {
     private let queue = DispatchQueue(label: "PKGSender.USBBridge", qos: .userInitiated)
     private var listener: NWListener?
     private var listenerReady = false
+    private var listenerGeneration = UUID()
     private var pendingStartCompletions: [(Result<Void, Error>) -> Void] = []
     private var selectedURL: URL?
     private var selectedFD: Int32 = -1
@@ -71,7 +72,7 @@ final class USBBridgeServer {
             guard let self else { return }
             self.transferObserver = observer
             self.setSelectedFileLocked(fileURL)
-            guard self.selectedFD >= 0 else {
+            guard self.selectedFD >= 0, self.selectedSize > 0 else {
                 DispatchQueue.main.async {
                     completion(.failure(USBBridgeServerError.fileUnavailable(fileURL.lastPathComponent)))
                 }
@@ -107,6 +108,7 @@ final class USBBridgeServer {
             self.transferArmed = false
             self.transferObserver = nil
             self.closeSelectedFile()
+            self.stopListenerLocked()
         }
     }
 
@@ -120,10 +122,15 @@ final class USBBridgeServer {
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
-            let newListener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+            guard port > 0, let listenPort = NWEndpoint.Port(rawValue: port) else {
+                throw USBBridgeServerError.listenerFailed("Invalid bridge port: \(port)")
+            }
+            let generation = UUID()
+            listenerGeneration = generation
+            let newListener = try NWListener(using: params, on: listenPort)
             newListener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
             newListener.stateUpdateHandler = { [weak self] state in
-                guard let self else { return }
+                guard let self, self.listenerGeneration == generation else { return }
                 switch state {
                 case .ready:
                     self.listenerReady = true
@@ -156,6 +163,17 @@ final class USBBridgeServer {
         let callbacks = pendingStartCompletions
         pendingStartCompletions.removeAll()
         callbacks.forEach { $0(result) }
+    }
+
+    private func stopListenerLocked() {
+        let oldListener = listener
+        listener = nil
+        listenerReady = false
+        listenerGeneration = UUID()
+        oldListener?.cancel()
+        finishStartCompletions(.failure(
+            USBBridgeServerError.listenerFailed("The USB bridge was stopped before it became ready.")
+        ))
     }
 
     private func closeSelectedFile() {
@@ -253,7 +271,11 @@ final class USBBridgeServer {
                 guard let p = raw.baseAddress else { return -1 }
                 return Darwin.pread(selectedFD, p, count, off_t(off))
             }
-            guard got >= 0 else { send(Data("ERR READ \(errno)\n".utf8), on: c); return }
+            guard got > 0 else {
+                let code = got < 0 ? errno : EIO
+                send(Data("ERR READ \(code)\n".utf8), on: c)
+                return
+            }
             if got < data.count { data.removeSubrange(got..<data.count) }
             // Send the framing header first, then the body. Count the range only
             // after Network.framework reports the body send as processed.

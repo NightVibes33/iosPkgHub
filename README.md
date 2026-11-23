@@ -40,7 +40,7 @@ Progress is calculated from unique byte ranges sent by the iPhone. Repeated, ove
 
 USB mode is not ordinary USB mass-storage copying. The app includes a prebuilt PS4 ELF payload named `pkgusb.elf` and implements the iPhone-side TCP protocol endpoint.
 
-The iPhone app listens on TCP port `11112`. Its bridge understands these newline-delimited commands:
+The iPhone app starts its TCP bridge on port `11112` for an active transfer and closes the listener when that transfer cycle ends. Its bridge understands these newline-delimited commands:
 
 - `HELLO` → `PKGBRIDGE/2 READY`
 - `INFO` → package size and filename, once a transfer is armed
