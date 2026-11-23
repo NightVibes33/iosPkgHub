@@ -112,7 +112,7 @@ jobs:
           PY
 
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")
-          test "$BUNDLE_ID" = "com.mrw.PKGSender"
+          test "$BUNDLE_ID" = "com.pkgsender.app"
           file "$APP_PATH/PKGSender"
 
           rm -rf package
