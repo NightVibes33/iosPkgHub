@@ -6,6 +6,7 @@ import UIKit
 struct ToolsView: View {
     let appLanguage: String
     let psIP: String
+    @AppStorage("playStationBinLoaderPort") private var binLoaderPort = "9090"
     @State private var showFTP = false
     private var isArabic: Bool { appLanguage == "ar" }
     private func t(_ en: String, _ ar: String) -> String { isArabic ? ar : en }
@@ -16,7 +17,7 @@ struct ToolsView: View {
                 VStack(spacing: 18) {
                     consoleCard
                     section(t("CONSOLE", "الجهاز")) {
-                        NavigationLink { ConsoleInfoPage(host: psIP, isArabic: isArabic) } label: {
+                        NavigationLink { ConsoleInfoPage(host: psIP, isArabic: isArabic, binLoaderPort: binLoaderPort) } label: {
                             toolCard(t("Console Info", "معلومات الجهاز"), t("RPI • FTP • installed titles", "RPI • FTP • الألعاب المثبتة"), "info.circle.fill")
                         }
                     }
@@ -637,6 +638,12 @@ private enum FTPDownloadStore{static func root()throws->URL{let fm=FileManager.d
 private struct ConsoleInfoPage: View {
     let host: String
     let isArabic: Bool
+    let binLoaderPort: String
+
+    private var configuredBinLoaderPort: UInt16 {
+        guard let value = UInt16(binLoaderPort), value > 0 else { return 9090 }
+        return value
+    }
 
     @StateObject private var ftp = FTPService()
     @State private var rpi: Bool?
@@ -716,7 +723,7 @@ private struct ConsoleInfoPage: View {
             Divider()
             serviceLine("GoldHEN FTP", port: 2121, state: ftpOK)
             Divider()
-            serviceLine("BinLoader", port: 9090, state: binLoader)
+            serviceLine("BinLoader", port: configuredBinLoaderPort, state: binLoader)
             Divider()
             serviceLine("Klog", port: 3232, state: klog)
         }
@@ -763,7 +770,7 @@ private struct ConsoleInfoPage: View {
         checking = true
         async let a = TCPProbe.check(host: host, port: 12800)
         async let b = TCPProbe.check(host: host, port: 2121)
-        async let c = TCPProbe.check(host: host, port: 9090)
+        async let c = TCPProbe.check(host: host, port: configuredBinLoaderPort)
         async let d = TCPProbe.check(host: host, port: 3232)
         let states = await (a, b, c, d)
         rpi = states.0; ftpOK = states.1; binLoader = states.2; klog = states.3

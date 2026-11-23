@@ -255,6 +255,7 @@ struct ContentView: View {
     @State private var isTransferQueueExpanded = false
 
     @State private var isSending = false
+    @State private var activeUSBTransferID: UUID?
     @State private var usbWatchdogToken = UUID()
     @State private var completed = false
     @State private var wasCancelled = false
@@ -2596,6 +2597,10 @@ struct ContentView: View {
         }
 
         prepareNewTransfer()
+        let transferID = UUID()
+        activeUSBTransferID = transferID
+        let packageSize = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        totalBytes = UInt64(max(packageSize, 0))
         transferStartDate = Date()
         speedSamplesTotal = 0
         speedSamplesCount = 0
@@ -2607,14 +2612,15 @@ struct ContentView: View {
 
         USBBridgeServer.shared.prepareTransfer(
             fileURL: file,
+            transferID: transferID,
             observer: { snapshot in
                 DispatchQueue.main.async {
-                    guard self.isSending else { return }
-                    self.applyUSBTransferSnapshot(snapshot)
+                    guard self.isSending, self.activeUSBTransferID == transferID else { return }
+                    self.applyUSBTransferSnapshot(snapshot, transferID: transferID)
                 }
             },
             completion: { result in
-                guard self.isSending else {
+                guard self.isSending, self.activeUSBTransferID == transferID else {
                     USBBridgeServer.shared.endTransferCycle()
                     return
                 }
@@ -2626,14 +2632,14 @@ struct ContentView: View {
                         "جسر USB جاهز. جارٍ إرسال البايلود إلى GoldHEN BinLoader…"
                     )
                     PayloadManager.shared.sendBuiltInPayload(host: self.psIP, port: payloadPort) { payloadResult in
-                        guard self.isSending else { return }
+                        guard self.isSending, self.activeUSBTransferID == transferID else { return }
                         switch payloadResult {
                         case .success:
                             self.status = self.t(
                                 "Payload sent. Waiting for the PS4 USBMUX connection…",
                                 "تم إرسال البايلود. بانتظار اتصال USBMUX من البلايستيشن…"
                             )
-                            self.scheduleUSBWatchdog()
+                            self.scheduleUSBWatchdog(for: transferID)
                         case .failure(let error):
                             self.failUSBTransfer(
                                 self.t("Could not start the USB payload: \(error.localizedDescription)",
@@ -2652,11 +2658,12 @@ struct ContentView: View {
         )
     }
 
-    private func scheduleUSBWatchdog() {
+    private func scheduleUSBWatchdog(for transferID: UUID) {
         let token = UUID()
         usbWatchdogToken = token
         DispatchQueue.main.asyncAfter(deadline: .now() + 180) {
             guard self.usbWatchdogToken == token,
+                  self.activeUSBTransferID == transferID,
                   self.isSending,
                   self.transferMode == .usb else { return }
             self.failUSBTransfer(
@@ -2667,6 +2674,7 @@ struct ContentView: View {
     }
 
     private func failUSBTransfer(_ message: String) {
+        activeUSBTransferID = nil
         usbWatchdogToken = UUID()
         USBBridgeServer.shared.endTransferCycle()
         saveHistory(completed: false)
@@ -2678,8 +2686,11 @@ struct ContentView: View {
         status = message
     }
 
-    private func applyUSBTransferSnapshot(_ transfer: USBTransferSnapshot) {
-        scheduleUSBWatchdog()
+    private func applyUSBTransferSnapshot(_ transfer: USBTransferSnapshot, transferID: UUID) {
+        guard activeUSBTransferID == transferID else { return }
+        if transfer.sentBytes > sentBytes {
+            scheduleUSBWatchdog(for: transferID)
+        }
         progress = transfer.fraction
         sentBytes = transfer.sentBytes
         totalBytes = transfer.totalBytes
@@ -2701,15 +2712,16 @@ struct ContentView: View {
         }
 
         if transfer.fraction >= 1 {
-            finishUSBTransfer()
+            finishUSBTransfer(transferID: transferID)
         } else if transfer.sentBytes > 0 {
             status = t("Transferring package over USB…", "جارٍ نقل ملف PKG عبر USB…")
         }
     }
 
-    private func finishUSBTransfer() {
-        guard isSending else { return }
+    private func finishUSBTransfer(transferID: UUID) {
+        guard isSending, activeUSBTransferID == transferID else { return }
 
+        activeUSBTransferID = nil
         usbWatchdogToken = UUID()
         USBBridgeServer.shared.endTransferCycle()
         if let current = activeQueueIndex, packageQueue.indices.contains(current) {
@@ -3035,6 +3047,7 @@ struct ContentView: View {
     private func cancelTransfer() {
 
         if transferMode == .usb {
+            activeUSBTransferID = nil
             usbWatchdogToken = UUID()
             USBBridgeServer.shared.endTransferCycle()
         }
@@ -3417,6 +3430,7 @@ struct ContentView: View {
 
     private func prepareNewTransfer() {
 
+        activeUSBTransferID = nil
         usbWatchdogToken = UUID()
         server?.stop()
         server = nil

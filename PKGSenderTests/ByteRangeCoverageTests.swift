@@ -18,11 +18,19 @@ final class ByteRangeCoverageTests: XCTestCase {
     func testOverlappingAndDuplicateRangesAreCountedOnce() {
         var coverage = ByteRangeCoverage()
 
-        coverage.add(start: 0, length: 60, limit: 100)
-        coverage.add(start: 40, length: 60, limit: 100)
-        coverage.add(start: 20, length: 30, limit: 100)
-        coverage.add(start: 0, length: 60, limit: 100)
+        coverage.add(start: 0, length: 40, limit: 100)
+        XCTAssertEqual(coverage.coveredBytes, 40)
 
+        coverage.add(start: 20, length: 30, limit: 100)
+        XCTAssertEqual(coverage.coveredBytes, 50)
+
+        coverage.add(start: 20, length: 30, limit: 100)
+        XCTAssertEqual(coverage.coveredBytes, 50)
+
+        coverage.add(start: 0, length: 40, limit: 100)
+        XCTAssertEqual(coverage.coveredBytes, 50)
+
+        coverage.add(start: 50, length: 50, limit: 100)
         XCTAssertEqual(coverage.coveredBytes, 100)
     }
 

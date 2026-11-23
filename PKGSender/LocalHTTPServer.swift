@@ -764,8 +764,6 @@ final class LocalHTTPServer {
                         self.speedSamples =
                             [(time: Date(), bytes: 0)]
 
-                        self.highestPosition =
-                            start
 
                         self.smoothedSpeed =
                             0
