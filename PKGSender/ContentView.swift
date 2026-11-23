@@ -4423,7 +4423,7 @@ private struct PlayStationSettings: View {
         }
         .navigationTitle(t("PlayStation", "بلايستيشن"))
         .navigationBarTitleDisplayMode(.inline)
-        .environment(.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
+        .environment(\.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
     }
 }
 
