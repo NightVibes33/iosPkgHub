@@ -1,8 +1,8 @@
 import Foundation
 import Network
 
-/// Sends the bundled PKG USB ELF to GoldHEN's BinLoader (TCP 9090).
-/// The ELF is bundled with the IPA so USB transfer can always start offline.
+/// Sends the bundled PS4 ELF to GoldHEN BinLoader over TCP (default port 9090).
+/// The subsequent PKG data path is separate and uses the USBMUX bridge.
 final class PayloadManager {
     static let shared = PayloadManager()
 
@@ -18,7 +18,7 @@ final class PayloadManager {
         var errorDescription: String? {
             switch self {
             case .invalidHost: return "Invalid PlayStation IP address."
-            case .invalidPort: return "Invalid GoldHEN BinLoader port. Use a value from 1 to 65535."
+            case .invalidPort: return "Invalid GoldHEN BinLoader port. Use a port from 1 to 65535."
             case .bundledPayloadMissing: return "Built-in pkgusb.elf is missing from the app bundle."
             case .customPayloadImportFailed(let message): return "Could not import payload: \(message)"
             case .readFailed(let error): return "Could not read built-in payload: \(error.localizedDescription)"
@@ -52,9 +52,10 @@ final class PayloadManager {
         do { data = try Data(contentsOf: sourceURL, options: .mappedIfSafe) }
         catch { throw PayloadError.customPayloadImportFailed(error.localizedDescription) }
 
-        guard data.count >= 4,
-              data[0] == 0x7F, data[1] == 0x45, data[2] == 0x4C, data[3] == 0x46 else {
-            throw PayloadError.customPayloadImportFailed("The selected file is not an ELF payload.")
+        guard isSupportedPS4ELF(data) else {
+            throw PayloadError.customPayloadImportFailed(
+                "Expected a 64-bit, little-endian x86-64 PS4 ELF executable."
+            )
         }
 
         let folder = customPayloadURL.deletingLastPathComponent()
@@ -75,6 +76,19 @@ final class PayloadManager {
     private func activePayloadURL() -> URL? {
         if hasCustomPayload { return customPayloadURL }
         return Bundle.main.url(forResource: "pkgusb", withExtension: "elf")
+    }
+
+    private func isSupportedPS4ELF(_ data: Data) -> Bool {
+        guard data.count >= 64,
+              data[0] == 0x7F, data[1] == 0x45,
+              data[2] == 0x4C, data[3] == 0x46,
+              data[4] == 2,
+              data[5] == 1
+        else { return false }
+
+        let type = UInt16(data[16]) | (UInt16(data[17]) << 8)
+        let machine = UInt16(data[18]) | (UInt16(data[19]) << 8)
+        return (type == 2 || type == 3) && machine == 62
     }
 
     func bundledVersion() -> String {
@@ -107,16 +121,14 @@ final class PayloadManager {
             return
         }
 
-        guard payload.count >= 4,
-              payload[0] == 0x7F, payload[1] == 0x45,
-              payload[2] == 0x4C, payload[3] == 0x46 else {
-            let message = "Active payload is not a valid ELF file."
+        guard isSupportedPS4ELF(payload) else {
+            let message = "Active payload is not a compatible 64-bit x86-64 PS4 ELF."
             TransferDiagnostics.log("PAYLOAD 9090 ABORT invalid ELF bytes=\(payload.count) file=\(elfURL.lastPathComponent)")
             DispatchQueue.main.async { completion(.failure(PayloadError.sendFailed(message))) }
             return
         }
 
-        guard port > 0, let nwPort = NWEndpoint.Port(rawValue: port) else {
+        guard let nwPort = NWEndpoint.Port(rawValue: port), port > 0 else {
             TransferDiagnostics.log("PAYLOAD ABORT invalid port=\(port)")
             DispatchQueue.main.async { completion(.failure(PayloadError.invalidPort)) }
             return

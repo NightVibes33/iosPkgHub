@@ -1,12 +1,14 @@
 name: Build PKG Sender iOS 27 unsigned IPA
-run-name: PKG Sender iOS 27 • ${{ github.sha }}
 
 on:
   workflow_dispatch:
   push:
     branches:
       - main
-      - fix/usb-bridge-ios27
+      - fix/usb-network-port-and-ios27-build
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
@@ -20,10 +22,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify macOS 27 and Xcode 27
+      - name: Verify macOS 27 and iOS 27 SDK
         run: |
           sw_vers
-          test "$(sw_vers -productVersion | cut -d. -f1)" = "27"
           xcodebuild -version
           xcodebuild -showsdks | tee sdk-list.txt
           grep -q "iOS 27" sdk-list.txt
@@ -35,14 +36,16 @@ jobs:
           fi
           xcodegen --version
 
-      - name: Create app icon assets
+      - name: Create App Icon Assets
         run: |
           ICON_FILE=$(find . -type f -iname "PKGSender_AppIcon_1024.png" | head -n 1)
           test -n "$ICON_FILE"
           mkdir -p PKGSender/Assets.xcassets/AppIcon.appiconset
           cp "$ICON_FILE" PKGSender/Assets.xcassets/AppIcon.appiconset/AppIcon.png
           cat > PKGSender/Assets.xcassets/Contents.json <<'EOF'
-          {"info":{"author":"xcode","version":1}}
+          {
+            "info": { "author": "xcode", "version": 1 }
+          }
           EOF
           cat > PKGSender/Assets.xcassets/AppIcon.appiconset/Contents.json <<'EOF'
           {
@@ -54,14 +57,14 @@ jobs:
                 "size": "1024x1024"
               }
             ],
-            "info": {"author":"xcode","version":1}
+            "info": { "author": "xcode", "version": 1 }
           }
           EOF
 
-      - name: Generate Xcode project
+      - name: Generate Xcode Project
         run: xcodegen generate
 
-      - name: Run unit tests on iOS 27 simulator
+      - name: Run unit tests on iOS 27 Simulator
         run: |
           xcodebuild test \
             -project PKGSender.xcodeproj \
@@ -99,6 +102,15 @@ jobs:
           echo "Bundled payload SHA256: $ACTUAL_SHA"
           test "$ACTUAL_SHA" = "$EXPECTED_SHA"
 
+          python3 - "$APP_PATH/pkgusb.elf" <<'PY'
+          import struct, sys
+          data = open(sys.argv[1], "rb").read(64)
+          assert data[:4] == b"\x7fELF", "payload is not ELF"
+          assert data[4] == 2 and data[5] == 1, "payload must be ELF64 little-endian"
+          assert struct.unpack_from("<H", data, 18)[0] == 62, "payload must target x86-64"
+          print("Bundled PS4 payload ELF header: OK")
+          PY
+
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")
           test "$BUNDLE_ID" = "com.pkgsender.app"
           file "$APP_PATH/PKGSender"
@@ -110,6 +122,7 @@ jobs:
           unzip -t PKGSender-iOS27-unsigned.ipa
 
           {
+            echo "Repository: $GITHUB_REPOSITORY"
             echo "Commit: $GITHUB_SHA"
             echo "Runner OS: $ImageOS $ImageVersion"
             sw_vers

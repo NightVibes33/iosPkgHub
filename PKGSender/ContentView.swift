@@ -179,8 +179,6 @@ struct ContentView: View {
     @AppStorage("playStationBinLoaderPort")
     private var binLoaderPort = "9090"
 
-    @State private var usbWatchdogToken = UUID()
-
     @AppStorage("hasCompletedFirstLaunch")
     private var hasCompletedFirstLaunch = false
 
@@ -217,6 +215,7 @@ struct ContentView: View {
 
     @State private var checkedIP = ""
     @State private var checkedPort = ""
+    @State private var rpiRequestID = UUID()
 
     @State private var transferMode: TransferMode = .wifi
 
@@ -257,6 +256,8 @@ struct ContentView: View {
     @State private var isTransferQueueExpanded = false
 
     @State private var isSending = false
+    @State private var activeUSBTransferID: UUID?
+    @State private var usbWatchdogToken = UUID()
     @State private var completed = false
     @State private var wasCancelled = false
 
@@ -346,9 +347,7 @@ struct ContentView: View {
                     )
                     transferModeCard
                     if transferMode == .usb { usbPayloadStatusCard }
-                    if transferMode == .wifi {
-                        connectionCard
-                    }
+                    connectionCard
                     fileCard
 
                     if isSending || progress > 0 || wasCancelled {
@@ -2584,93 +2583,101 @@ struct ContentView: View {
     }
 
     private func sendCurrentPackageOverUSB() {
+        guard !psIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            status = "Enter the PS4 IP address first."
+            return
+        }
         guard let file = selectedFile else {
             status = t("Select a PKG file first.", "اختر ملف PKG أولاً.")
             return
         }
 
-        let portText = binLoaderPort.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let parsedPort = UInt16(portText), parsedPort > 0 else {
-            status = t(
-                "Invalid GoldHEN BinLoader port. Enter a value from 1 to 65535.",
-                "منفذ GoldHEN BinLoader غير صالح. أدخل قيمة من 1 إلى 65535."
-            )
+        let cleanPort = binLoaderPort.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let payloadPort = UInt16(cleanPort), payloadPort > 0 else {
+            status = t("Invalid GoldHEN BinLoader port. Enter a value from 1 to 65535.",
+                       "منفذ BinLoader غير صالح. أدخل قيمة من 1 إلى 65535.")
             return
         }
 
         prepareNewTransfer()
+        let transferID = UUID()
+        activeUSBTransferID = transferID
+        let packageSize = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0
+        totalBytes = UInt64(max(packageSize, 0))
         transferStartDate = Date()
+        speedSamplesTotal = 0
+        speedSamplesCount = 0
+        peakSpeed = 0
         historySavedForTransfer = false
         isSending = true
         UIApplication.shared.isIdleTimerDisabled = true
-        status = t("Preparing USB bridge…", "جارٍ تجهيز جسر USB…")
+        status = t("Preparing the USB bridge…", "جارٍ تجهيز جسر USB…")
 
         USBBridgeServer.shared.prepareTransfer(
             fileURL: file,
+            transferID: transferID,
             observer: { snapshot in
                 DispatchQueue.main.async {
-                    guard self.isSending else { return }
-                    self.applyUSBTransferSnapshot(snapshot)
+                    guard self.isSending, self.activeUSBTransferID == transferID else { return }
+                    self.applyUSBTransferSnapshot(snapshot, transferID: transferID)
                 }
             },
             completion: { result in
-                guard self.isSending else {
+                guard self.isSending, self.activeUSBTransferID == transferID else {
                     USBBridgeServer.shared.endTransferCycle()
                     return
                 }
+
                 switch result {
                 case .success:
                     self.status = self.t(
-                        "USB bridge ready. Injecting payload through GoldHEN BinLoader…",
-                        "جسر USB جاهز. جارٍ إرسال البايلود عبر GoldHEN BinLoader…"
+                        "USB bridge ready. Sending the payload to GoldHEN BinLoader…",
+                        "جسر USB جاهز. جارٍ إرسال البايلود إلى GoldHEN BinLoader…"
                     )
-                    PayloadManager.shared.sendBuiltInPayload(host: self.psIP, port: parsedPort) { payloadResult in
-                        guard self.isSending else { return }
+                    PayloadManager.shared.sendBuiltInPayload(host: self.psIP, port: payloadPort) { payloadResult in
+                        guard self.isSending, self.activeUSBTransferID == transferID else { return }
                         switch payloadResult {
                         case .success:
                             self.status = self.t(
-                                "Payload sent. Waiting for the PS4 bridge to request the PKG…",
-                                "تم إرسال البايلود. بانتظار طلب PS4 لملف PKG عبر الجسر…"
+                                "Payload sent. Waiting for the PS4 USBMUX connection…",
+                                "تم إرسال البايلود. بانتظار اتصال USBMUX من البلايستيشن…"
                             )
-                            self.scheduleUSBWatchdog()
+                            self.scheduleUSBWatchdog(for: transferID)
                         case .failure(let error):
                             self.failUSBTransfer(
-                                self.t(
-                                    "Could not start the USB payload: \(error.localizedDescription)",
-                                    "تعذر تشغيل بايلود USB: \(error.localizedDescription)"
-                                )
+                                self.t("Could not start the USB payload: \(error.localizedDescription)",
+                                       "تعذر تشغيل بايلود USB: \(error.localizedDescription)")
                             )
                         }
                     }
+
                 case .failure(let error):
                     self.failUSBTransfer(
-                        self.t(
-                            "Could not prepare the USB bridge: \(error.localizedDescription)",
-                            "تعذر تجهيز جسر USB: \(error.localizedDescription)"
-                        )
+                        self.t("Could not prepare the USB bridge: \(error.localizedDescription)",
+                               "تعذر تجهيز جسر USB: \(error.localizedDescription)")
                     )
                 }
             }
         )
     }
 
-    private func scheduleUSBWatchdog() {
+    private func scheduleUSBWatchdog(for transferID: UUID) {
         let token = UUID()
         usbWatchdogToken = token
         DispatchQueue.main.asyncAfter(deadline: .now() + 180) {
             guard self.usbWatchdogToken == token,
+                  self.activeUSBTransferID == transferID,
                   self.isSending,
                   self.transferMode == .usb else { return }
             self.failUSBTransfer(
-                self.t(
-                    "USB transfer stalled: no package data arrived for 3 minutes. Check the cable, payload log, and BinLoader connection.",
-                    "توقف نقل USB: لم تصل بيانات الحزمة لمدة 3 دقائق. تحقق من الكابل وسجل البايلود واتصال BinLoader."
-                )
+                self.t("USB transfer stalled: no package data moved for 3 minutes. Check the cable and PS4 payload log.",
+                       "توقف نقل USB: لم تتحرك بيانات الحزمة لمدة 3 دقائق. تحقق من الكابل وسجل البايلود.")
             )
         }
     }
 
     private func failUSBTransfer(_ message: String) {
+        activeUSBTransferID = nil
         usbWatchdogToken = UUID()
         USBBridgeServer.shared.endTransferCycle()
         saveHistory(completed: false)
@@ -2682,8 +2689,11 @@ struct ContentView: View {
         status = message
     }
 
-    private func applyUSBTransferSnapshot(_ transfer: USBTransferSnapshot) {
-        scheduleUSBWatchdog()
+    private func applyUSBTransferSnapshot(_ transfer: USBTransferSnapshot, transferID: UUID) {
+        guard activeUSBTransferID == transferID else { return }
+        if transfer.sentBytes > sentBytes {
+            scheduleUSBWatchdog(for: transferID)
+        }
         progress = transfer.fraction
         sentBytes = transfer.sentBytes
         totalBytes = transfer.totalBytes
@@ -2705,15 +2715,16 @@ struct ContentView: View {
         }
 
         if transfer.fraction >= 1 {
-            finishUSBTransfer()
+            finishUSBTransfer(transferID: transferID)
         } else if transfer.sentBytes > 0 {
             status = t("Transferring package over USB…", "جارٍ نقل ملف PKG عبر USB…")
         }
     }
 
-    private func finishUSBTransfer() {
-        guard isSending else { return }
+    private func finishUSBTransfer(transferID: UUID) {
+        guard isSending, activeUSBTransferID == transferID else { return }
 
+        activeUSBTransferID = nil
         usbWatchdogToken = UUID()
         USBBridgeServer.shared.endTransferCycle()
         if let current = activeQueueIndex, packageQueue.indices.contains(current) {
@@ -2732,8 +2743,8 @@ struct ContentView: View {
         UIApplication.shared.isIdleTimerDisabled = false
         saveHistory(completed: true)
         status = t(
-            "All PKG byte ranges were served to the PS4. Check the console for BGFT installation status.",
-            "تم إرسال جميع نطاقات بيانات PKG إلى PS4. تحقق من حالة التثبيت في الجهاز."
+            "All PKG bytes were served through the USB bridge. Check the PS4 for BGFT installation status.",
+            "تم إرسال جميع بايتات PKG عبر جسر USB. تحقق من حالة التثبيت في PS4."
         )
 
         if queueRunning, let current = activeQueueIndex {
@@ -2755,8 +2766,8 @@ struct ContentView: View {
                     self.packageQueue.removeAll()
                 }
                 status = t(
-                    "All queued PKG data was served. Check the PS4 for installation results.",
-                    "تم إرسال بيانات جميع الحزم. تحقق من نتائج التثبيت على PS4."
+                    "All queued PKG data was served to the PS4. Check the console for installation results.",
+                    "تم إرسال بيانات جميع الحزم إلى PS4. تحقق من نتائج التثبيت على الجهاز."
                 )
             }
         } else if let file = selectedFile {
@@ -3039,6 +3050,7 @@ struct ContentView: View {
     private func cancelTransfer() {
 
         if transferMode == .usb {
+            activeUSBTransferID = nil
             usbWatchdogToken = UUID()
             USBBridgeServer.shared.endTransferCycle()
         }
@@ -3310,109 +3322,76 @@ struct ContentView: View {
 
         TransferDiagnostics.log("RPI POST begin endpoint=\(url.absoluteString) package=\(packageURL)")
 
-        URLSession.shared
-            .dataTask(
-                with: request
-            ) {
-                data,
-                response,
-                error in
+        let requestID = UUID()
+        rpiRequestID = requestID
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            DispatchQueue.main.async {
+                guard self.isSending, self.rpiRequestID == requestID else { return }
+                let raw = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                TransferDiagnostics.log("RPI POST response HTTP=\((response as? HTTPURLResponse)?.statusCode ?? 0) body=\(raw.prefix(2048))")
+                let normalized = raw.replacingOccurrences(of: #"0x([0-9a-fA-F]+)"#, with: #""0x$1""#, options: .regularExpression)
+                let json = (try? JSONSerialization.jsonObject(with: Data(normalized.utf8))) as? [String: Any]
+                guard error == nil,
+                      let http = response as? HTTPURLResponse,
+                      (200...299).contains(http.statusCode),
+                      json?["status"] as? String == "success",
+                      let taskID = json?["task_id"] as? Int else {
+                    self.failRPI(error?.localizedDescription ?? (raw.isEmpty ? "Invalid installation response" : raw))
+                    return
+                }
+                guard taskID >= 0 else {
+                    self.failRPI("Package already installed (task_id -1).")
+                    return
+                }
+                self.status = self.t("PS4 accepted task \(taskID). Waiting for download…", "تم قبول المهمة \(taskID). بانتظار التنزيل…")
+                self.pollRPI(url: url, taskID: taskID, requestID: requestID, deadline: Date().addingTimeInterval(120))
+            }
+        }.resume()
+    }
 
-                DispatchQueue
-                    .main
-                    .async {
+    private func failRPI(_ message: String) {
+        rpiRequestID = UUID()
+        TransferDiagnostics.log("RPI FAILED \(message)")
+        server?.stop()
+        server = nil
+        isSending = false
+        queueRunning = false
+        UIApplication.shared.isIdleTimerDisabled = false
+        status = "PS4 installation: \(message)"
+    }
 
-                        guard
-                            self
-                                .isSending
-                        else {
+    private func pollRPI(url: URL, taskID: Int, requestID: UUID, deadline: Date) {
+        guard isSending, rpiRequestID == requestID else { return }
+        if Date() > deadline && sentBytes == 0 {
+            failRPI("No package download started within 120 seconds.")
+            return
+        }
+        var request = URLRequest(url: url.deletingLastPathComponent().appendingPathComponent("get_task_progress"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 8
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task_id": taskID])
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            DispatchQueue.main.async {
+                guard self.isSending, self.rpiRequestID == requestID else { return }
+                if let data, let raw = String(data: data, encoding: .utf8) {
+                    TransferDiagnostics.log("RPI TASK \(taskID) \(raw.prefix(2048))")
+                    let normalized = raw.replacingOccurrences(of: #"0x([0-9a-fA-F]+)"#, with: #""0x$1""#, options: .regularExpression)
+                    if let json = (try? JSONSerialization.jsonObject(with: Data(normalized.utf8))) as? [String: Any] {
+                        let code = json["error"] ?? json["error_code"]
+                        let codeText = code.map { String(describing: $0) } ?? "0"
+                        let numericCode = codeText.lowercased().hasPrefix("0x") ? UInt64(codeText.dropFirst(2), radix: 16) : UInt64(codeText)
+                        if json["status"] as? String == "fail" || (numericCode ?? 0) != 0 {
+                            self.failRPI(raw)
                             return
-                        }
-
-                        if let error =
-                            error {
-
-                            TransferDiagnostics.log("RPI POST error=\(error.localizedDescription)")
-                            self.connectionState = .disconnected
-                            self.checkedIP = ""
-                            self.checkedPort = ""
-
-                            self.isSending =
-                                false
-
-                            UIApplication
-                                .shared
-                                .isIdleTimerDisabled =
-                                    false
-
-                            self.status =
-                                self.isArabic
-                                ? "\u{62E}\u{637}\u{623} \u{641}\u{64A} \u{627}\u{644}\u{625}\u{631}\u{633}\u{627}\u{644}: \(error.localizedDescription)"
-                                : "Send error: \(error.localizedDescription)"
-
-                            return
-                        }
-
-                        if let http =
-                            response
-                            as?
-                            HTTPURLResponse {
-
-                            TransferDiagnostics.log("RPI POST response status=\(http.statusCode) bytes=\(data?.count ?? 0)")
-
-                            if (200...299)
-                                .contains(
-                                    http
-                                        .statusCode
-                                ) {
-
-                                self.status =
-                                    self.t(
-                                        "PlayStation accepted the package. Waiting for download...",
-                                        "\u{62A}\u{645} \u{642}\u{628}\u{648}\u{644} \u{627}\u{644}\u{645}\u{644}\u{641} \u{645}\u{646} \u{627}\u{644}\u{628}\u{644}\u{627}\u{64A}\u{633}\u{62A}\u{64A}\u{634}\u{646}. \u{628}\u{627}\u{646}\u{62A}\u{638}\u{627}\u{631} \u{628}\u{62F}\u{621} \u{627}\u{644}\u{62A}\u{62D}\u{645}\u{64A}\u{644}..."
-                                    )
-
-                            } else {
-
-                                self.connectionState = .disconnected
-                                self.checkedIP = ""
-                                self.checkedPort = ""
-
-                                self.isSending =
-                                    false
-
-                                UIApplication
-                                    .shared
-                                    .isIdleTimerDisabled =
-                                        false
-
-                                self.status =
-                                    self.isArabic
-                                    ? "\u{627}\u{644}\u{628}\u{644}\u{627}\u{64A}\u{633}\u{62A}\u{64A}\u{634}\u{646} \u{623}\u{639}\u{627}\u{62F} \u{62E}\u{637}\u{623} HTTP \(http.statusCode)"
-                                    : "PlayStation returned HTTP \(http.statusCode)"
-                            }
-                        }
-
-                        if let data =
-                            data,
-
-                           let text =
-                            String(
-                                data:
-                                    data,
-                                encoding:
-                                    .utf8
-                            ),
-
-                           !text.isEmpty {
-
-                            print(
-                                "PlayStation: \(text)"
-                            )
                         }
                     }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    self.pollRPI(url: url, taskID: taskID, requestID: requestID, deadline: deadline)
+                }
             }
-            .resume()
+        }.resume()
     }
 
     // ======================================================
@@ -3420,7 +3399,10 @@ struct ContentView: View {
     // ======================================================
 
     private func prepareNewTransfer() {
+        rpiRequestID = UUID()
 
+        activeUSBTransferID = nil
+        usbWatchdogToken = UUID()
         server?.stop()
         server = nil
 
@@ -4343,7 +4325,9 @@ private struct PlayStationSettings: View {
                     Text(psPort).foregroundStyle(.secondary).monospacedDigit()
                 }
                 Button(t("Save RPI port", "حفظ منفذ RPI")) {
-                    if validRPI, let value = Int(rpiDraft) { psPort = String(value) }
+                    if validRPI, let value = Int(rpiDraft) {
+                        psPort = String(value)
+                    }
                 }
                 .disabled(!validRPI)
                 if psPort != "12800" {
@@ -4355,11 +4339,12 @@ private struct PlayStationSettings: View {
             } header: {
                 Text(t("NETWORK · REMOTE PACKAGE INSTALLER", "الشبكة · REMOTE PACKAGE INSTALLER"))
             } footer: {
-                Text(t("This port is used only by Network mode. Default: 12800.", "يُستخدم هذا المنفذ في وضع الشبكة فقط. الافتراضي: 12800."))
+                Text(t("This is the PS4 Remote Package Installer port. The default is 12800. It affects Network mode only.",
+                       "هذا منفذ Remote Package Installer على PS4. القيمة الافتراضية 12800 ويؤثر على وضع الشبكة فقط."))
             }
 
             Section {
-                TextField(t("GoldHEN BinLoader port", "منفذ GoldHEN BinLoader"), text: $binLoaderDraft)
+                TextField(t("BinLoader port", "منفذ BinLoader"), text: $binLoaderDraft)
                     .keyboardType(.numberPad)
                 HStack {
                     Text(t("Active port", "المنفذ الحالي"))
@@ -4367,7 +4352,9 @@ private struct PlayStationSettings: View {
                     Text(binLoaderPort).foregroundStyle(.secondary).monospacedDigit()
                 }
                 Button(t("Save BinLoader port", "حفظ منفذ BinLoader")) {
-                    if validBinLoader, let value = Int(binLoaderDraft) { binLoaderPort = String(value) }
+                    if validBinLoader, let value = Int(binLoaderDraft) {
+                        binLoaderPort = String(value)
+                    }
                 }
                 .disabled(!validBinLoader)
                 if binLoaderPort != "9090" {
@@ -4377,21 +4364,28 @@ private struct PlayStationSettings: View {
                     }
                 }
             } header: {
-                Text(t("USB · PAYLOAD INJECTION", "USB · إرسال البايلود"))
+                Text(t("USB · GOLDHEN BINLOADER", "USB · GOLDHEN BINLOADER"))
             } footer: {
-                Text(t("This TCP port sends pkgusb.elf to GoldHEN BinLoader. Default: 9090. It does not change the iPhone bridge port.", "هذا منفذ TCP لإرسال pkgusb.elf إلى GoldHEN BinLoader. الافتراضي: 9090. لا يغير منفذ جسر الآيفون."))
+                Text(t("The ELF payload is injected over TCP before the PKG data moves through the USBMUX cable bridge. GoldHEN commonly uses port 9090.",
+                       "يتم إرسال البايلود عبر TCP قبل نقل بيانات PKG عبر جسر USBMUX والكابل. يستخدم GoldHEN عادة المنفذ 9090."))
             }
 
             Section {
                 HStack {
-                    Text(t("iPhone PKG bridge", "جسر PKG للآيفون"))
+                    Text(t("iPhone USB bridge", "جسر USB للآيفون"))
                     Spacer()
                     Text("11112").foregroundStyle(.secondary).monospacedDigit()
                 }
+                HStack {
+                    Text(t("PS4 internal HTTP proxy", "وكيل HTTP الداخلي لـ PS4"))
+                    Spacer()
+                    Text("11113").foregroundStyle(.secondary).monospacedDigit()
+                }
             } header: {
-                Text(t("PAYLOAD PROTOCOL", "بروتوكول البايلود"))
+                Text(t("PAYLOAD-MANAGED PORTS", "منافذ يديرها البايلود"))
             } footer: {
-                Text(t("The app listens on this fixed TCP port for HELLO, INFO, and READ commands from the bundled payload. Keep the app and payload protocol versions matched.", "يستمع التطبيق على منفذ TCP الثابت هذا لأوامر HELLO وINFO وREAD من البايلود المدمج. يجب أن تتوافق إصدارات التطبيق والبايلود."))
+                Text(t("These ports are part of the bundled payload protocol. They are intentionally read-only and must not be changed independently of the ELF.",
+                       "هذه المنافذ جزء من بروتوكول البايلود المدمج. لا يمكن تغييرها ويجب عدم تعديلها بشكل منفصل عن ملف ELF."))
             }
         }
         .onAppear {
@@ -4400,7 +4394,7 @@ private struct PlayStationSettings: View {
         }
         .navigationTitle(t("PlayStation", "بلايستيشن"))
         .navigationBarTitleDisplayMode(.inline)
-        .environment(\.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
+        
     }
 }
 

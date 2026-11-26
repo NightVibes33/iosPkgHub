@@ -1,12 +1,14 @@
 import Foundation
 
-/// Tracks unique, half-open byte ranges from parallel and out-of-order reads.
+/// Tracks unique byte coverage for parallel and out-of-order HTTP/USB range reads.
+/// Ranges are half-open: [start, end).
 struct ByteRangeCoverage {
     private(set) var coveredBytes: UInt64 = 0
     private var ranges: [(start: UInt64, end: UInt64)] = []
 
     mutating func add(start: UInt64, length: UInt64, limit: UInt64) {
         guard length > 0, limit > 0, start < limit else { return }
+
         let addition = start.addingReportingOverflow(length)
         let end = min(limit, addition.overflow ? limit : addition.partialValue)
         guard end > start else { return }
@@ -37,7 +39,7 @@ struct ByteRangeCoverage {
         }
 
         ranges = merged
-        coveredBytes = ranges.reduce(UInt64(0)) { $0 + ($1.end - $1.start) }
+        coveredBytes = ranges.reduce(0) { $0 + ($1.end - $1.start) }
     }
 
     mutating func reset() {
