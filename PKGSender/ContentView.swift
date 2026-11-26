@@ -215,6 +215,7 @@ struct ContentView: View {
 
     @State private var checkedIP = ""
     @State private var checkedPort = ""
+    @State private var rpiRequestID = UUID()
 
     @State private var transferMode: TransferMode = .wifi
 
@@ -346,9 +347,7 @@ struct ContentView: View {
                     )
                     transferModeCard
                     if transferMode == .usb { usbPayloadStatusCard }
-                    if transferMode == .wifi {
-                        connectionCard
-                    }
+                    connectionCard
                     fileCard
 
                     if isSending || progress > 0 || wasCancelled {
@@ -2584,6 +2583,10 @@ struct ContentView: View {
     }
 
     private func sendCurrentPackageOverUSB() {
+        guard !psIP.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            status = "Enter the PS4 IP address first."
+            return
+        }
         guard let file = selectedFile else {
             status = t("Select a PKG file first.", "اختر ملف PKG أولاً.")
             return
@@ -3319,109 +3322,76 @@ struct ContentView: View {
 
         TransferDiagnostics.log("RPI POST begin endpoint=\(url.absoluteString) package=\(packageURL)")
 
-        URLSession.shared
-            .dataTask(
-                with: request
-            ) {
-                data,
-                response,
-                error in
+        let requestID = UUID()
+        rpiRequestID = requestID
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            DispatchQueue.main.async {
+                guard self.isSending, self.rpiRequestID == requestID else { return }
+                let raw = data.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+                TransferDiagnostics.log("RPI POST response HTTP=\((response as? HTTPURLResponse)?.statusCode ?? 0) body=\(raw.prefix(2048))")
+                let normalized = raw.replacingOccurrences(of: #"0x([0-9a-fA-F]+)"#, with: #""0x$1""#, options: .regularExpression)
+                let json = (try? JSONSerialization.jsonObject(with: Data(normalized.utf8))) as? [String: Any]
+                guard error == nil,
+                      let http = response as? HTTPURLResponse,
+                      (200...299).contains(http.statusCode),
+                      json?["status"] as? String == "success",
+                      let taskID = json?["task_id"] as? Int else {
+                    self.failRPI(error?.localizedDescription ?? (raw.isEmpty ? "Invalid installation response" : raw))
+                    return
+                }
+                guard taskID >= 0 else {
+                    self.failRPI("Package already installed (task_id -1).")
+                    return
+                }
+                self.status = self.t("PS4 accepted task \(taskID). Waiting for download…", "تم قبول المهمة \(taskID). بانتظار التنزيل…")
+                self.pollRPI(url: url, taskID: taskID, requestID: requestID, deadline: Date().addingTimeInterval(120))
+            }
+        }.resume()
+    }
 
-                DispatchQueue
-                    .main
-                    .async {
+    private func failRPI(_ message: String) {
+        rpiRequestID = UUID()
+        TransferDiagnostics.log("RPI FAILED \(message)")
+        server?.stop()
+        server = nil
+        isSending = false
+        queueRunning = false
+        UIApplication.shared.isIdleTimerDisabled = false
+        status = "PS4 installation: \(message)"
+    }
 
-                        guard
-                            self
-                                .isSending
-                        else {
+    private func pollRPI(url: URL, taskID: Int, requestID: UUID, deadline: Date) {
+        guard isSending, rpiRequestID == requestID else { return }
+        if Date() > deadline && sentBytes == 0 {
+            failRPI("No package download started within 120 seconds.")
+            return
+        }
+        var request = URLRequest(url: url.deletingLastPathComponent().appendingPathComponent("get_task_progress"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 8
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["task_id": taskID])
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            DispatchQueue.main.async {
+                guard self.isSending, self.rpiRequestID == requestID else { return }
+                if let data, let raw = String(data: data, encoding: .utf8) {
+                    TransferDiagnostics.log("RPI TASK \(taskID) \(raw.prefix(2048))")
+                    let normalized = raw.replacingOccurrences(of: #"0x([0-9a-fA-F]+)"#, with: #""0x$1""#, options: .regularExpression)
+                    if let json = (try? JSONSerialization.jsonObject(with: Data(normalized.utf8))) as? [String: Any] {
+                        let code = json["error"] ?? json["error_code"]
+                        let codeText = code.map { String(describing: $0) } ?? "0"
+                        let numericCode = codeText.lowercased().hasPrefix("0x") ? UInt64(codeText.dropFirst(2), radix: 16) : UInt64(codeText)
+                        if json["status"] as? String == "fail" || (numericCode ?? 0) != 0 {
+                            self.failRPI(raw)
                             return
-                        }
-
-                        if let error =
-                            error {
-
-                            TransferDiagnostics.log("RPI POST error=\(error.localizedDescription)")
-                            self.connectionState = .disconnected
-                            self.checkedIP = ""
-                            self.checkedPort = ""
-
-                            self.isSending =
-                                false
-
-                            UIApplication
-                                .shared
-                                .isIdleTimerDisabled =
-                                    false
-
-                            self.status =
-                                self.isArabic
-                                ? "\u{62E}\u{637}\u{623} \u{641}\u{64A} \u{627}\u{644}\u{625}\u{631}\u{633}\u{627}\u{644}: \(error.localizedDescription)"
-                                : "Send error: \(error.localizedDescription)"
-
-                            return
-                        }
-
-                        if let http =
-                            response
-                            as?
-                            HTTPURLResponse {
-
-                            TransferDiagnostics.log("RPI POST response status=\(http.statusCode) bytes=\(data?.count ?? 0)")
-
-                            if (200...299)
-                                .contains(
-                                    http
-                                        .statusCode
-                                ) {
-
-                                self.status =
-                                    self.t(
-                                        "PlayStation accepted the package. Waiting for download...",
-                                        "\u{62A}\u{645} \u{642}\u{628}\u{648}\u{644} \u{627}\u{644}\u{645}\u{644}\u{641} \u{645}\u{646} \u{627}\u{644}\u{628}\u{644}\u{627}\u{64A}\u{633}\u{62A}\u{64A}\u{634}\u{646}. \u{628}\u{627}\u{646}\u{62A}\u{638}\u{627}\u{631} \u{628}\u{62F}\u{621} \u{627}\u{644}\u{62A}\u{62D}\u{645}\u{64A}\u{644}..."
-                                    )
-
-                            } else {
-
-                                self.connectionState = .disconnected
-                                self.checkedIP = ""
-                                self.checkedPort = ""
-
-                                self.isSending =
-                                    false
-
-                                UIApplication
-                                    .shared
-                                    .isIdleTimerDisabled =
-                                        false
-
-                                self.status =
-                                    self.isArabic
-                                    ? "\u{627}\u{644}\u{628}\u{644}\u{627}\u{64A}\u{633}\u{62A}\u{64A}\u{634}\u{646} \u{623}\u{639}\u{627}\u{62F} \u{62E}\u{637}\u{623} HTTP \(http.statusCode)"
-                                    : "PlayStation returned HTTP \(http.statusCode)"
-                            }
-                        }
-
-                        if let data =
-                            data,
-
-                           let text =
-                            String(
-                                data:
-                                    data,
-                                encoding:
-                                    .utf8
-                            ),
-
-                           !text.isEmpty {
-
-                            print(
-                                "PlayStation: \(text)"
-                            )
                         }
                     }
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    self.pollRPI(url: url, taskID: taskID, requestID: requestID, deadline: deadline)
+                }
             }
-            .resume()
+        }.resume()
     }
 
     // ======================================================
@@ -3429,6 +3399,7 @@ struct ContentView: View {
     // ======================================================
 
     private func prepareNewTransfer() {
+        rpiRequestID = UUID()
 
         activeUSBTransferID = nil
         usbWatchdogToken = UUID()
@@ -4423,7 +4394,7 @@ private struct PlayStationSettings: View {
         }
         .navigationTitle(t("PlayStation", "بلايستيشن"))
         .navigationBarTitleDisplayMode(.inline)
-        .environment(\.layoutDirection, isArabic ? .rightToLeft : .leftToRight)
+        
     }
 }
 
